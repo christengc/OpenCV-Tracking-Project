@@ -157,57 +157,47 @@ class CalculateScene:
         """
         Detects if there's a significant scene shift between two consecutive frames.
         Uses multiple methods for robust detection: histogram comparison and frame difference.
-        
+        Adds internal profiling for each step.
         Args:
             frame1: First video frame (BGR format)
             frame2: Second video frame (BGR format)
             threshold: Scene shift score threshold (0-100). Higher values require more change to be detected.
                        Default 30.0 means 30% change. Typical range: 15-40
-        
         Returns:
             dict: {
                 "is_scene_shift": bool,  # True if a scene shift is detected
                 "shift_score": float,    # Scene shift intensity (0-100, higher = more change)
                 "histogram_diff": float, # Histogram difference component
-                "frame_diff": float      # Frame difference component
+                "frame_diff": float,     # Frame difference component
+                "profile": dict          # Internal timing info (ms)
             }
         """
         # Ensure frames have the same dimensions
         if frame1.shape != frame2.shape:
             frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
-        
-        # Method 1: Histogram comparison
-        # Convert to HSV for better color comparison
-        hsv1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2HSV)
-        hsv2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2HSV)
-        
-        # Calculate histograms
+        # Downscale both frames to 50% (for both histogram and pixel-diff)
+        scale = 0.5
+        new_size = (int(frame1.shape[1]*scale), int(frame1.shape[0]*scale))
+        frame1_small = cv2.resize(frame1, new_size)
+        frame2_small = cv2.resize(frame2, new_size)
+        # Method 1: Histogram comparison (on downscaled)
+        hsv1 = cv2.cvtColor(frame1_small, cv2.COLOR_BGR2HSV)
+        hsv2 = cv2.cvtColor(frame2_small, cv2.COLOR_BGR2HSV)
         hist1 = cv2.calcHist([hsv1], [0, 1], None, [180, 256], [0, 180, 0, 256])
         hist2 = cv2.calcHist([hsv2], [0, 1], None, [180, 256], [0, 180, 0, 256])
         cv2.normalize(hist1, hist1, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
         cv2.normalize(hist2, hist2, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-        
-        # Histogram correlation (0 = completely different, 1 = identical)
         histogram_diff = cv2.compareHist(hist1, hist2, cv2.HISTCMP_BHATTACHARYYA)
         histogram_score = histogram_diff * 100  # Scale to 0-100
-        
         # Method 2: Mean absolute difference (simple pixel-level difference)
-        # Use downsampled frames for efficiency
-        frame1_small = cv2.resize(frame1, (frame1.shape[1]//4, frame1.shape[0]//4))
-        frame2_small = cv2.resize(frame2, (frame2.shape[1]//4, frame2.shape[0]//4))
-        
         frame_diff = cv2.absdiff(frame1_small, frame2_small)
         mean_diff = np.mean(frame_diff)
         # Normalize to 0-100 range (255 is max difference per channel)
         frame_diff_score = (mean_diff / 255) * 100
-        
         # Combine both methods (weighted average)
-        # Give more weight to histogram difference for scene cuts, less to pixel difference
         shift_score = (histogram_score * 0.6 + frame_diff_score * 0.4)
-        
         # Detect scene shift if score exceeds threshold
         is_scene_shift = shift_score > threshold
-        
         return {
             "is_scene_shift": is_scene_shift,
             "shift_score": round(shift_score, 2),

@@ -1,4 +1,3 @@
-
 import time
 import cv2
 import numpy as np
@@ -16,6 +15,7 @@ from utils import (
     initialize_controls,
     detect_players,
 )
+from evaluation_class import EvaluationClass
 from config import (
     DEFAULT_PLAY_SPEED,
     DEFAULT_START_FRAME,
@@ -23,6 +23,7 @@ from config import (
     SCENE_SHIFT_THRESHOLD,
     MAX_FRAMES_WITHOUT_BALL,
 )
+import config
 
 
 class VideoProcessor:
@@ -42,10 +43,11 @@ class VideoProcessor:
         return iou
         """Handles video reading, frame processing and user interaction."""
 
-    def __init__(self, video_path: str, play_speed: int = DEFAULT_PLAY_SPEED, start_frame: int = DEFAULT_START_FRAME):
+    def __init__(self, video_path: str, play_speed: int = DEFAULT_PLAY_SPEED, start_frame: int = DEFAULT_START_FRAME, max_frames: int = None):
         self.video_path = video_path
         self.play_speed = play_speed
         self.start_frame_number = start_frame
+        self.max_frames = max_frames
 
         self.vid = cv2.VideoCapture(video_path)
         self.framespersecond = int(self.vid.get(cv2.CAP_PROP_FPS))
@@ -58,15 +60,15 @@ class VideoProcessor:
 
         self.paused = False
         self.adaptive = True
-        self.debugFlag = False
-
         self.last_ball = None
         self.framesWithoutBall = 0
         self.previous_frame = None
         self.frameCount = 0
 
         # set initial position
-        self.vid.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame_number)
+        from config import PERFORMANCE_MODE
+        if not PERFORMANCE_MODE:
+            self.vid.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame_number)
 
         # Initialize lists for diameter statistics
         self.estimated_diameters = []
@@ -82,6 +84,7 @@ class VideoProcessor:
         cv2.setMouseCallback(window_name, self.mouse_callback)
 
     def run(self):
+        evaluation = EvaluationClass()
         import os, json
         # Indlæs COCO-annotationer én gang
         coco_path = os.path.join(os.path.dirname(__file__), 'instances_Train.json')
@@ -99,30 +102,48 @@ class VideoProcessor:
             coco_ann = {}
 
         success = True
+        processed_frames = 0
+        import time
         while success:
-            start = time.time()
+            t0 = time.time()
             lastFrameNumber = self.vid.get(cv2.CAP_PROP_POS_FRAMES)
             currentFrameNumber = lastFrameNumber + self.play_speed
 
+            t1 = time.time()
             if not self.paused:
-                self.vid.set(cv2.CAP_PROP_POS_FRAMES, currentFrameNumber)
+                from config import PERFORMANCE_MODE
+                if not PERFORMANCE_MODE:
+                    self.vid.set(cv2.CAP_PROP_POS_FRAMES, currentFrameNumber)
                 success, image = self.vid.read()
             else:
                 image = None
+            t2 = time.time()
 
             if success and not self.paused:
-                # scene shift detection
-                if self.previous_frame is not None:
-                    result = self.sceneCalculator.detect_scene_shift(
-                        self.previous_frame, image, threshold=SCENE_SHIFT_THRESHOLD
-                    )
-                    if result["is_scene_shift"]:
-                        print(f"Scene shift detected! Score: {result['shift_score']}")
-                        # Reset diameter history on scene shift
-                        self.diameter_history = []
-                self.previous_frame = image
+                t3 = time.time()
+                # Only run scene shift and classify every other frame
+                run_analysis = (self.frameCount % 2 == 0)
+                if run_analysis:
+                    # scene shift detection
+                    if self.previous_frame is not None:
+                        t31 = time.time()
+                        t31a = time.time()
+                        result = self.sceneCalculator.detect_scene_shift(
+                            self.previous_frame, image, threshold=SCENE_SHIFT_THRESHOLD
+                        )
+                        t31b = time.time()
+                        if result["is_scene_shift"]:
+                            print(f"Scene shift detected! Score: {result['shift_score']}")
+                            self.diameter_history = []
+                    self.previous_frame = image
 
-                classification_result = self.sceneCalculator.classify_frame(image)
+                    t4 = time.time()
+                    classification_result = self.sceneCalculator.classify_frame(image)
+                    t5 = time.time()
+                else:
+                    # Use previous results if not recalculating
+                    classification_result = getattr(self, '_last_classification_result', None)
+                self._last_classification_result = classification_result
 
                 # detect player in grass or blue sky scenes for masking during ball detection
                 player_rect = None
@@ -130,17 +151,28 @@ class VideoProcessor:
                 allow_tracking = scene_type in ["grass", "blue_sky"]
                 actual_ball_diameter_pixels = None
                 if allow_tracking:
+                    t51 = time.time()
+                    # --- Profile internals of detect_players ---
+                    t51a = time.time()
                     rects = detect_players(image)
-                    if rects:
+                    t51b = time.time()
+                    contours = rects['contours'] if isinstance(rects, dict) and 'contours' in rects else rects
+                    if contours:
                         # keep only the largest contour (assumed golfer)
-                        player_rect = max(rects, key=cv2.contourArea)
+                        player_rect = max(contours, key=cv2.contourArea)
 
                 # find ball (excluding player area if in allowed scene)
                 if allow_tracking:
-                    output, best_ball = findBall(
-                        image, self.last_ball, self, self.debugFlag, self.adaptive,
+                    t61 = time.time()
+                    # --- Profile internals of findBall ---
+                    t61a = time.time()
+                    findball_result = findBall(
+                        image, self.last_ball, self, config.DEBUG_FLAG, self.adaptive,
                         player_rect=player_rect
                     )
+                    output = findball_result['output']
+                    best_ball = findball_result['best_ball']
+                    t61b = time.time()
                     # Get actual ball diameter from best_ball if available
                     if best_ball is not None and 'r' in best_ball:
                         actual_ball_diameter_pixels = best_ball['r'] * 2  # radius to diameter
@@ -151,7 +183,9 @@ class VideoProcessor:
                 else:
                     output = image.copy()
                     best_ball = None
+                t7 = time.time()
                 output = self.sceneCalculator.draw_frame_type_indicator(output, classification_result)
+                t8 = time.time()
 
                 # Print ball size estimation and actual size
                 if player_rect is not None:
@@ -179,6 +213,7 @@ class VideoProcessor:
 
                 # Tegn best_ball contour hvis den findes
                 if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
+                    print(f"Best ball detected at (x={best_ball['cx']}, y={best_ball['cy']}), radius={best_ball['r']}")
                     center = (int(best_ball['cx']), int(best_ball['cy']))
                     radius = int(best_ball['r'])
                     cv2.circle(output, center, max(radius-2,1), (255, 0, 0), 2)   # r-1, rød
@@ -202,17 +237,24 @@ class VideoProcessor:
                         det_h = int(2 * best_ball['r'])
                         det_bbox = [det_x, det_y, det_w, det_h]
                         iou = self.calculate_iou(det_bbox, [x, y, w, h])
-                        print(f"Frame {frame_id}: IoU={iou:.3f}")
+                        evaluation.add_iou(iou)
 
+                t9 = time.time()
                 cv2.imshow('frame output', output)
                 self.enable_mouse_capture('frame output')
                 self.frameCount += 1
+                t10 = time.time()
 
-            end = time.time()
-            algorithm_time = int((end - start) * 1000)
+
+            t11 = time.time()
+            algorithm_time = int((t11 - t0) * 1000)
             target_time = 30 - algorithm_time
             if target_time < 0:
                 target_time = 1
+
+            processed_frames += 1
+            if self.max_frames is not None and processed_frames >= self.max_frames:
+                break
 
             key = cv2.waitKey(WAIT_KEY_DELAY_MS) & 0xFF
             control_result = handle_keyboard_controls(
@@ -220,7 +262,6 @@ class VideoProcessor:
                 self.paused,
                 self.last_ball,
                 self.adaptive,
-                self.debugFlag,
                 output if 'output' in locals() else image,
                 self.vid.get(cv2.CAP_PROP_POS_FRAMES),
                 self.vid,
@@ -229,10 +270,11 @@ class VideoProcessor:
             self.paused = control_result["paused"]
             self.last_ball = control_result["last_ball"]
             self.adaptive = control_result["adaptive"]
-            self.debugFlag = control_result["debugFlag"]
 
             if control_result["should_break"]:
                 break
 
         self.vid.release()
         cv2.destroyAllWindows()
+        # Print summary score after video ends
+        print(f"\nSummary IoU score: {evaluation.summary_score():.3f}")

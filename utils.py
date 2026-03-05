@@ -60,7 +60,13 @@ def hue2Opencv(worldValue):
 
 
 def adaptive_s_threshold(inputImage, percentile_value=15, min_v=45):
-    hsv = cv2.cvtColor(inputImage, cv2.COLOR_BGR2HSV)
+    # Nedskalér inputbilledet til 25% for hurtigere beregning
+    scale = 0.25
+    h0, w0 = inputImage.shape[:2]
+    new_size = (int(w0 * scale), int(h0 * scale))
+    small_img = cv2.resize(inputImage, new_size)
+
+    hsv = cv2.cvtColor(small_img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
     mu = np.mean(s)
@@ -68,7 +74,7 @@ def adaptive_s_threshold(inputImage, percentile_value=15, min_v=45):
 
     threshold = mu - 1.5 * sigma
     if(threshold < min_v):
-            threshold = min_v
+        threshold = min_v
 
     return threshold
 
@@ -110,7 +116,7 @@ def draw_ball_overlay(output, golfBall, framesWithoutBall):
     return output
 
 
-def handle_keyboard_controls(key, paused, last_ball, adaptive, debugFlag, image, currentFrameNumber, vid):
+def handle_keyboard_controls(key, paused, last_ball, adaptive, image, currentFrameNumber, vid):
     """
     Handles keyboard input and updates state accordingly.
     Returns updated state dictionary.
@@ -150,8 +156,9 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, debugFlag, image,
         print("Adaptive mode:", adaptive)
 
     elif key == ord('d'):      # debug flag toggle
-        debugFlag = not debugFlag
-        print("debugFlag:", debugFlag)
+        import config
+        config.DEBUG_FLAG = not config.DEBUG_FLAG
+        print("debugFlag:", config.DEBUG_FLAG)
 
     elif key == ord('t'):      # toggle player detection method
         import config
@@ -162,7 +169,6 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, debugFlag, image,
         "paused": paused,
         "last_ball": last_ball,
         "adaptive": adaptive,
-        "debugFlag": debugFlag,
         "should_break": should_break
     }
 
@@ -202,12 +208,28 @@ def detect_players_yolov8(frame):
         try:
             from ultralytics import YOLO
             _yolo_detector = YOLO("yolov8n-seg.pt")  # nano segmentation model for tight fit
+            # Forsøg at flytte modellen til GPU hvis tilgængelig
+            try:
+                _yolo_detector.to('cuda')
+                _yolo_detector.half()
+                print("YOLOv8 kører nu på GPU (CUDA) med half precision (FP16)")
+            except Exception as e:
+                print(f"Kunne ikke flytte YOLOv8 til GPU eller aktivere half precision: {e}")
+             # Frys model weights her:
+            _yolo_detector.eval()
         except ImportError:
             print("WARNING: ultralytics not installed. Run: pip install ultralytics")
             return []
 
+    # Nedskaler inputbilledet til 50% i både bredde og højde
+    scale = 0.25
+    h, w = frame.shape[:2]
+    new_size = (int(w * scale), int(h * scale))
+    frame_small = cv2.resize(frame, new_size)
+
     # run inference and keep only person detections (class 0)
-    results = _yolo_detector(frame, verbose=False)
+    # Brug YOLOv8 med mindre inputstørrelse (imgsz=256)
+    results = _yolo_detector(frame_small, verbose=False, imgsz=256, classes=[0])
     contours = []
     for result in results:
         boxes = result.boxes
@@ -220,7 +242,8 @@ def detect_players_yolov8(frame):
                 # Use mask from result.masks if available and index matches
                 if mask_data is not None and i < mask_data.shape[0]:
                     mask = mask_data[i]
-                    mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
+                    # Opskalér masken til original størrelse
+                    mask = cv2.resize(mask, (w, h))
                     mask = (mask > 0.5).astype(np.uint8)
                     # Dilate mask to make it looser
                     dilate_kernel = np.ones((15, 15), np.uint8)
@@ -230,7 +253,8 @@ def detect_players_yolov8(frame):
                         largest = max(cnts, key=cv2.contourArea)
                         contours.append(largest)
                 else:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    # Opskalér boks-koordinater til original størrelse
+                    x1, y1, x2, y2 = [int(coord / scale) for coord in box.xyxy[0]]
                     contours.append(np.array([[[x1, y1]], [[x2, y1]], [[x2, y2]], [[x1, y2]]]))
     return contours
 
@@ -241,12 +265,52 @@ def detect_players(frame):
     Supports HOG (fast, less accurate) and YOLOv8 (slower, more accurate).
     Method is controlled by config.DETECTION_METHOD.
     """
+    import time
     from config import DETECTION_METHOD
-    
+    # --- Interpolering og frame-tælling ---
+    if not hasattr(detect_players, "_frame_counter"):
+        detect_players._frame_counter = 0
+        detect_players._last_contours = None
+        detect_players._prev_contours = None
+    detect_players._frame_counter += 1
+
     if DETECTION_METHOD == "yolov8":
-        return detect_players_yolov8(frame)
+        # Kør YOLOv8 kun på hver tredje frame
+        if detect_players._frame_counter % 3 == 1:
+            result = detect_players_yolov8(frame)
+            detect_players._prev_contours = detect_players._last_contours
+            detect_players._last_contours = result
+            contours = result
+        else:
+            # Interpolér position hvis muligt
+            if detect_players._prev_contours is not None and detect_players._last_contours is not None:
+                # For simplicity: lineær interpolation af bounding box for største contour
+                def contour_center(contour):
+                    M = cv2.moments(contour)
+                    if M["m00"] == 0:
+                        return (0, 0)
+                    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+                prev = detect_players._prev_contours
+                last = detect_players._last_contours
+                if prev and last:
+                    prev_c = max(prev, key=cv2.contourArea)
+                    last_c = max(last, key=cv2.contourArea)
+                    c0 = contour_center(prev_c)
+                    c1 = contour_center(last_c)
+                    interp_c = (int((c0[0]+c1[0])/2), int((c0[1]+c1[1])/2))
+                    # Flyt hele contour til interpoleret center
+                    dx = interp_c[0] - c1[0]
+                    dy = interp_c[1] - c1[1]
+                    interp_contour = last_c + np.array([[[dx, dy]]])
+                    contours = [interp_contour]
+                else:
+                    contours = detect_players._last_contours if detect_players._last_contours is not None else []
+            else:
+                contours = detect_players._last_contours if detect_players._last_contours is not None else []
     else:
-        return detect_players_hog(frame)
+        result = detect_players_hog(frame)
+        contours = result
+    return {'contours': contours}
 
 
 def create_player_exclusion_mask(frame_shape, player_rect, margin=20):

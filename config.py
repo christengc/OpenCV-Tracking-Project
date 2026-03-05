@@ -1,3 +1,6 @@
+# Performance mode: hvis True, undgå dyre operationer som set(cv2.CAP_PROP_POS_FRAMES)
+PERFORMANCE_MODE = False
+DEBUG_FLAG = True
 """Global configuration and default constants used throughout the tracker.
 
 Putting hard‑coded numbers in a central module makes it easier to tune
@@ -30,7 +33,7 @@ TRACKBAR_SETTINGS = {
     "V min": (0, 255),
     "V max": (255, 255),
     "circularity": (67, 100),
-    "Size min": (50, 50),
+    "Size min": (50, 5000),
     "Size Max": (4000, 90000),
 }
 

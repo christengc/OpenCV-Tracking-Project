@@ -3,6 +3,7 @@ import numpy as np
 
 from utils import removeComputerGraphics, adaptive_s_threshold, hue2Opencv
 from config import (
+    PERFORMANCE_MODE,
     WATER_LOWER,
     WATER_UPPER,
     COLOR_SIMILARITY_TOLERANCE,
@@ -25,20 +26,16 @@ def waterMirroMask(inputImage, hsv):
 
 
 def calculateGolfballhsvMask(inputImage, hsv, debug, adaptive):
-    b, g, r = cv2.split(inputImage)
-    diff_rg = cv2.absdiff(r, g)
-    diff_rb = cv2.absdiff(r, b)
-    diff_gb = cv2.absdiff(g, b)
+    # Fast RGB similarity detection using cv2.absdiff (optimized C++ implementation)
     threshold = COLOR_SIMILARITY_TOLERANCE
+    diff_rg = cv2.absdiff(inputImage[:,:,2], inputImage[:,:,1])
+    diff_rb = cv2.absdiff(inputImage[:,:,2], inputImage[:,:,0])
+    diff_gb = cv2.absdiff(inputImage[:,:,1], inputImage[:,:,0])
     color_similarity = (diff_rg < threshold) & (diff_rb < threshold) & (diff_gb < threshold)
-    rgb_mask = (color_similarity.astype(np.uint8)) * 255
+    rgb_mask = color_similarity.astype(np.uint8) * 255
 
-    h_min = cv2.getTrackbarPos("Hmin", "Controls")
-    h_max = cv2.getTrackbarPos("Hmax", "Controls")
-    s_min = cv2.getTrackbarPos("Smin", "Controls")
-    s_max = cv2.getTrackbarPos("Smax", "Controls")
-    v_min = cv2.getTrackbarPos("Vmin", "Controls")
-    v_max = cv2.getTrackbarPos("Vmax", "Controls")
+    # Cache trackbar values in single unpacking for speed
+    h_min, h_max, s_min, s_max, v_min, v_max = [cv2.getTrackbarPos(n, "Controls") for n in ["Hmin", "Hmax", "Smin", "Smax", "Vmin", "Vmax"]]
 
     if adaptive:
         adaptive_threshold = adaptive_s_threshold(inputImage)
@@ -49,40 +46,30 @@ def calculateGolfballhsvMask(inputImage, hsv, debug, adaptive):
         upperhsv = (h_max, s_max, v_max)
 
     maskhsv = cv2.inRange(hsv, lowerhsv, upperhsv)
-    inv__maskhsv = maskhsv
- 
-    return cv2.bitwise_or(rgb_mask , inv__maskhsv)
+    return cv2.bitwise_or(rgb_mask, maskhsv)
 
 
 def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=None):
-    
-    #WATER MASK
-    watermask = waterMaks(inputImage, hsv)
-    inv_water_mask = cv2.bitwise_not(watermask)
 
-    #WATER MIRROR MASK
-    waterMirrorMask = waterMirroMask(inputImage, hsv)
-    inv_waterMirror_mask = cv2.bitwise_not(waterMirrorMask)
-   
-    # GOLFBALL MASK
+    #watermask = waterMaks(inputImage, hsv)
+    #inv_water_mask = cv2.bitwise_not(watermask)
+    #waterMirrorMask = waterMirroMask(inputImage, hsv)
+    #inv_waterMirror_mask = cv2.bitwise_not(waterMirrorMask)
+
     golfBallHSVMask = calculateGolfballhsvMask(inputImage, hsv, debug, adaptive)
-
 
     closing = cv2.morphologyEx(golfBallHSVMask, cv2.MORPH_CLOSE, kernel3)
     opening = cv2.morphologyEx(closing, cv2.MORPH_OPEN, kernel3)
+    dilate = cv2.dilate(opening, kernel3, iterations=1)
     
-    dilate = cv2.morphologyEx(opening, cv2.MORPH_DILATE, kernel3)
     # Black out region with graphics
     dilate[44:231, 1150:1850] = 0 #right side
     dilate[70:190, 75:1200] = 0  #left side
-    #remove image borders that cause false contours
     dilate[:80, :] = 0
     dilate[-80:, :] = 0
     dilate[:, :80] = 0
     dilate[:, -80:] = 0
 
-
-    #GRAPHICS MASK
     from config import DETECT_GRAPHICS
     graphics_mask = None
     if DETECT_GRAPHICS:
@@ -90,42 +77,45 @@ def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=Non
         graphics_rects = detect_graphics_rectangles(inputImage)
         if graphics_rects:
             graphics_mask = create_graphics_exclusion_mask(inputImage.shape, graphics_rects, margin=5)
-    
-    # combine ball mask with graphics mask
-    combined_graphics_dilate = None
-    if graphics_mask is not None:
-        combined_graphics_dilate = cv2.bitwise_and(dilate, graphics_mask)
 
-    else:
-        combined_graphics_dilate = dilate
-
-
-    # combine player mask and existing mask
+    combined_graphics_dilate = cv2.bitwise_and(dilate, graphics_mask) if graphics_mask is not None else dilate
 
     if player_exclusion_mask is not None:
         final_mask = cv2.bitwise_and(combined_graphics_dilate, player_exclusion_mask)
     else:
         final_mask = combined_graphics_dilate
+    cv2.imshow('combined_graphics_dilate', combined_graphics_dilate)
 
-    # --- Grass mask integration ---
     from config import GRASS_LOWER, GRASS_UPPER, CLASSIFY_GRASS_MIN_PERCENT
-    # Calculate grass mask and percent
     grass_mask = cv2.inRange(hsv, GRASS_LOWER, GRASS_UPPER)
     grass_percent = np.count_nonzero(grass_mask) / (inputImage.shape[0] * inputImage.shape[1]) * 100
     if grass_percent >= CLASSIFY_GRASS_MIN_PERCENT:
-        # Only call for grass frames
         final_mask = cv2.bitwise_and(final_mask, grass_mask)
 
-    cv2.imshow(f'final_mask', final_mask)
+    if not PERFORMANCE_MODE:
+        cv2.imshow(f'final_mask', final_mask)
 
     return final_mask
 
 
 def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
-    # Read checkboxes from control window
-    check_area = cv2.getTrackbarPos("Area", "Controls") == 1
-    check_solidity = cv2.getTrackbarPos("Solidity", "Controls") == 1
-    check_circularity = cv2.getTrackbarPos("Circularity", "Controls") == 1
+    # Cache trackbar values for performance
+    trackbar_values = {
+        "check_area": cv2.getTrackbarPos("Area", "Controls") == 1,
+        "check_solidity": cv2.getTrackbarPos("Solidity", "Controls") == 1,
+        "check_circularity": cv2.getTrackbarPos("Circularity", "Controls") == 1,
+        "circularityLimit": cv2.getTrackbarPos("Circ", "Controls") / 100.0,
+        "sizeMinLimit": cv2.getTrackbarPos("SzMin", "Controls"),
+        "sizeMaxLimit": cv2.getTrackbarPos("SzMax", "Controls"),
+        "check_dist": cv2.getTrackbarPos("Dist", "Controls") == 1
+    }
+    check_area = trackbar_values["check_area"]
+    check_solidity = trackbar_values["check_solidity"]
+    check_circularity = trackbar_values["check_circularity"]
+    circularityLimit = trackbar_values["circularityLimit"]
+    sizeMinLimit = trackbar_values["sizeMinLimit"]
+    sizeMaxLimit = trackbar_values["sizeMaxLimit"]
+    check_dist = trackbar_values["check_dist"]
     best_score = -1
     best_ball = None
     # Score weights (define above score calculation)
@@ -133,10 +123,6 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
     WEIGHT_HISTORY_DIST = 0.1
     WEIGHT_DIAMETER_LIKELIHOOD = 6.0
     WEIGHT_Y_BOOST = 25.0
-    circularityLimit = cv2.getTrackbarPos("Circ", "Controls") / 100.0
-    sizeMinLimit = cv2.getTrackbarPos("SzMin", "Controls")
-    sizeMaxLimit = cv2.getTrackbarPos("SzMax", "Controls")
-    check_dist = cv2.getTrackbarPos("Dist", "Controls") == 1
 
     contours, _ = cv2.findContours(binaryMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     # Visualize contours in the mask image
@@ -196,6 +182,7 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         circularity = 4 * np.pi * area / (perimeter * perimeter)
         # Circularity check
         if check_circularity:
+            print("circularity:", circularity, "limit:", circularityLimit)
             if circularity < circularityLimit:
                 countoursWrongCircularity += 1
                 contour_statuses.append((cnt, 'wrong_circularity'))
@@ -283,10 +270,10 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
                 text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
                 x_pos = w - text_size[0] - 10  # right
             cv2.putText(mask_vis, line, (x_pos, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 255), 2, cv2.LINE_AA)
-    cv2.imshow("final_mask", mask_vis)
-    if debug:
-        print("number of contours", len(contours))
 
+    if not PERFORMANCE_MODE:
+        cv2.imshow("final_mask", mask_vis)
+        
     # Draw only the top 3 candidates by score and print their score/components
     top_candidates = sorted(candidate_contours, key=lambda x: x['score'], reverse=True)[:3]
     for idx, cand in enumerate(top_candidates):
@@ -295,7 +282,16 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         text_pos = (int(cand['cx'] + cand['r'] + 10), int(cand['cy']))
         cv2.putText(output, f"{cand['score']:.1f}", text_pos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
     if debug:
-        print("countourWrongSize", countourWrongSize, "countoursWrongPerimeter", countoursWrongPerimeter,  "countourWrongSolidity", countourWrongSolidity, "countoursWrongCircularity", countoursWrongCircularity,"countoursCompletedLoop", countoursCompletedLoop, "countourCorrectScore", countourCorrectScore)
+        too_far_count = sum(1 for _, reason in contour_statuses if reason == 'too_far')
+        passed_scores = [f"{cand['score']:.2f}" for cand in sorted(candidate_contours, key=lambda x: x['score'], reverse=True)]
+        print(
+            f"[identifyContours] found={len(contours)} | "
+            f"checks(area={check_area}, solidity={check_solidity}, circularity={check_circularity}, dist={check_dist}) | "
+            f"limits(size=[{sizeMinLimit},{sizeMaxLimit}], circ>={circularityLimit:.2f}, solidity>=0.80, max_jump={MAX_JUMP_PIXELS}) | "
+            f"filtered(area={countourWrongSize}, solidity={countourWrongSolidity}, perimeter={countoursWrongPerimeter}, "
+            f"circularity={countoursWrongCircularity}, too_far={too_far_count}) | "
+            f"remaining={len(candidate_contours)} scores={passed_scores}"
+        )
     # Returner dict for best_ball, så contour kan tegnes
     best_ball_dict = None
     if candidate_contours:
@@ -314,9 +310,8 @@ def findBall(inputImage, last_ball, tracker, debug, adaptive, player_rect=None):
         player_exclusion_mask = create_player_exclusion_mask(inputImage.shape, player_rect, margin=PLAYER_MASK_MARGIN)
 
     waterAndBackgroundAndMorphologyMask = createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask)
-    # Pass tracker (with diameter_history) to identifyContours for diameter likelihood scoring
-    best_ball = identifyContours(inputImage, waterAndBackgroundAndMorphologyMask, output, tracker, last_ball, False)
-    return output, best_ball
+    best_ball = identifyContours(inputImage, waterAndBackgroundAndMorphologyMask, output, tracker, last_ball, debug)
+    return {'output': output, 'best_ball': best_ball}
 
 
 def mouse_callback(event, x, y, flags, param):
