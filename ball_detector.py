@@ -1,0 +1,328 @@
+import cv2
+import numpy as np
+
+from utils import removeComputerGraphics, adaptive_s_threshold, hue2Opencv
+from config import (
+    WATER_LOWER,
+    WATER_UPPER,
+    COLOR_SIMILARITY_TOLERANCE,
+    MAX_JUMP_PIXELS,
+)
+
+# morphological kernel used by mask creation
+kernel3 = np.ones((3,3),np.uint8)
+
+
+def waterMaks(inputImage, hsv):
+    # use configured HSV ranges for water areas
+    return cv2.inRange(hsv, WATER_LOWER, WATER_UPPER)
+
+
+def waterMirroMask(inputImage, hsv):
+    lower = (hue2Opencv(0), 0, 0)
+    upper = (hue2Opencv(59), 255, 255)
+    return cv2.inRange(hsv, lower, upper)
+
+
+def calculateGolfballhsvMask(inputImage, hsv, debug, adaptive):
+    b, g, r = cv2.split(inputImage)
+    diff_rg = cv2.absdiff(r, g)
+    diff_rb = cv2.absdiff(r, b)
+    diff_gb = cv2.absdiff(g, b)
+    threshold = COLOR_SIMILARITY_TOLERANCE
+    color_similarity = (diff_rg < threshold) & (diff_rb < threshold) & (diff_gb < threshold)
+    rgb_mask = (color_similarity.astype(np.uint8)) * 255
+
+    h_min = cv2.getTrackbarPos("Hmin", "Controls")
+    h_max = cv2.getTrackbarPos("Hmax", "Controls")
+    s_min = cv2.getTrackbarPos("Smin", "Controls")
+    s_max = cv2.getTrackbarPos("Smax", "Controls")
+    v_min = cv2.getTrackbarPos("Vmin", "Controls")
+    v_max = cv2.getTrackbarPos("Vmax", "Controls")
+
+    if adaptive:
+        adaptive_threshold = adaptive_s_threshold(inputImage)
+        lowerhsv = (h_min, 0, v_min)
+        upperhsv = (h_max, adaptive_threshold, v_max)
+    else:
+        lowerhsv = (h_min, s_min, v_min)
+        upperhsv = (h_max, s_max, v_max)
+
+    maskhsv = cv2.inRange(hsv, lowerhsv, upperhsv)
+    inv__maskhsv = maskhsv
+ 
+    return cv2.bitwise_or(rgb_mask , inv__maskhsv)
+
+
+def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=None):
+    
+    #WATER MASK
+    watermask = waterMaks(inputImage, hsv)
+    inv_water_mask = cv2.bitwise_not(watermask)
+
+    #WATER MIRROR MASK
+    waterMirrorMask = waterMirroMask(inputImage, hsv)
+    inv_waterMirror_mask = cv2.bitwise_not(waterMirrorMask)
+   
+    # GOLFBALL MASK
+    golfBallHSVMask = calculateGolfballhsvMask(inputImage, hsv, debug, adaptive)
+
+
+    closing = cv2.morphologyEx(golfBallHSVMask, cv2.MORPH_CLOSE, kernel3)
+    opening = cv2.morphologyEx(closing, cv2.MORPH_OPEN, kernel3)
+    
+    dilate = cv2.morphologyEx(opening, cv2.MORPH_DILATE, kernel3)
+    # Black out region with graphics
+    dilate[44:231, 1150:1850] = 0 #right side
+    dilate[70:190, 75:1200] = 0  #left side
+    #remove image borders that cause false contours
+    dilate[:80, :] = 0
+    dilate[-80:, :] = 0
+    dilate[:, :80] = 0
+    dilate[:, -80:] = 0
+
+
+    #GRAPHICS MASK
+    from config import DETECT_GRAPHICS
+    graphics_mask = None
+    if DETECT_GRAPHICS:
+        from utils import detect_graphics_rectangles, create_graphics_exclusion_mask
+        graphics_rects = detect_graphics_rectangles(inputImage)
+        if graphics_rects:
+            graphics_mask = create_graphics_exclusion_mask(inputImage.shape, graphics_rects, margin=5)
+    
+    # combine ball mask with graphics mask
+    combined_graphics_dilate = None
+    if graphics_mask is not None:
+        combined_graphics_dilate = cv2.bitwise_and(dilate, graphics_mask)
+
+    else:
+        combined_graphics_dilate = dilate
+
+
+    # combine player mask and existing mask
+
+    if player_exclusion_mask is not None:
+        final_mask = cv2.bitwise_and(combined_graphics_dilate, player_exclusion_mask)
+    else:
+        final_mask = combined_graphics_dilate
+
+    # --- Grass mask integration ---
+    from config import GRASS_LOWER, GRASS_UPPER, CLASSIFY_GRASS_MIN_PERCENT
+    # Calculate grass mask and percent
+    grass_mask = cv2.inRange(hsv, GRASS_LOWER, GRASS_UPPER)
+    grass_percent = np.count_nonzero(grass_mask) / (inputImage.shape[0] * inputImage.shape[1]) * 100
+    if grass_percent >= CLASSIFY_GRASS_MIN_PERCENT:
+        # Only call for grass frames
+        final_mask = cv2.bitwise_and(final_mask, grass_mask)
+
+    cv2.imshow(f'final_mask', final_mask)
+
+    return final_mask
+
+
+def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
+    # Read checkboxes from control window
+    check_area = cv2.getTrackbarPos("Area", "Controls") == 1
+    check_solidity = cv2.getTrackbarPos("Solidity", "Controls") == 1
+    check_circularity = cv2.getTrackbarPos("Circularity", "Controls") == 1
+    best_score = -1
+    best_ball = None
+    # Score weights (define above score calculation)
+    WEIGHT_CIRCULARITY = 8.0
+    WEIGHT_HISTORY_DIST = 0.1
+    WEIGHT_DIAMETER_LIKELIHOOD = 6.0
+    WEIGHT_Y_BOOST = 25.0
+    circularityLimit = cv2.getTrackbarPos("Circ", "Controls") / 100.0
+    sizeMinLimit = cv2.getTrackbarPos("SzMin", "Controls")
+    sizeMaxLimit = cv2.getTrackbarPos("SzMax", "Controls")
+    check_dist = cv2.getTrackbarPos("Dist", "Controls") == 1
+
+    contours, _ = cv2.findContours(binaryMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Visualize contours in the mask image
+    mask_vis = cv2.cvtColor(binaryMask, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(mask_vis, contours, -1, (0, 255, 255), 2)
+    # Write number of contours in lower left corner
+    h, w = mask_vis.shape[:2]
+    cv2.putText(mask_vis, f"Contours: {len(contours)}", (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
+
+    countourWrongSize = 0
+    countoursWrongPerimeter = 0
+    countoursWrongCircularity = 0
+    countoursCompletedLoop = 0
+    countourCorrectScore = 0
+    countourWrongSolidity = 0
+    frames_with_ball = getattr(getattr(tracker, 'golfBall', tracker), 'framesWithBall', 0)
+    # --- Diameter likelihood scoring ---
+    # Use tracker.diameter_history (to be set/reset externally) for last 10 diameters
+    # If not available, use general distribution mean=18, std=6
+    #if hasattr(tracker, 'diameter_history') and tracker.diameter_history and len(tracker.diameter_history) >= 3:
+    #    diameters = tracker.diameter_history[-10:]
+    #    mean_diam = float(np.mean(diameters))
+    #    std_diam = float(np.std(diameters))
+    #else:
+    mean_diam = 18.0
+    std_diam = 6.0
+
+    # Collect all candidate contours and their scores/components
+    candidate_contours = []
+    # For color-coding: store tuples (cnt, reason)
+    contour_statuses = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # Area check
+        if check_area:
+            if area < sizeMinLimit or area > sizeMaxLimit:
+                countourWrongSize += 1
+                contour_statuses.append((cnt, 'wrong_area'))
+                continue
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area > 0:
+            solidity = area / hull_area
+        else:
+            solidity = 0
+        # Solidity check
+        if check_solidity:
+            if solidity < 0.8:
+                countourWrongSolidity += 1
+                contour_statuses.append((cnt, 'wrong_solidity'))
+                continue
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            countoursWrongPerimeter += 1
+            contour_statuses.append((cnt, 'wrong_perimeter'))
+            continue
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        # Circularity check
+        if check_circularity:
+            if circularity < circularityLimit:
+                countoursWrongCircularity += 1
+                contour_statuses.append((cnt, 'wrong_circularity'))
+                continue
+        (x, y), r = cv2.minEnclosingCircle(cnt)
+        cx, cy = x, y
+        diameter = r * 2
+        diameter_likelihood = np.exp(-((diameter - mean_diam) ** 2.0) / (2.0 * std_diam ** 2.0))
+        if last_ball is not None and isinstance(last_ball, dict):
+            px, py, pr = last_ball['cx'], last_ball['cy'], last_ball['r']
+            dist = np.hypot(cx - px, cy - py)
+            historyWeight = 3.0 * (1 - np.exp(-0.2 * frames_with_ball))
+        else:
+            dist = 0
+            historyWeight = 0
+        # Distance check
+        if check_dist and dist > MAX_JUMP_PIXELS:
+            contour_statuses.append((cnt, 'too_far'))
+            continue
+        dist_norm = dist / (r + 1)
+        frame_height = inputImage.shape[0]
+        y_boost = WEIGHT_Y_BOOST if cy > frame_height / 2 else 0
+        score = (
+            WEIGHT_CIRCULARITY * circularity
+            - historyWeight * dist_norm * WEIGHT_HISTORY_DIST
+            + WEIGHT_DIAMETER_LIKELIHOOD * diameter_likelihood
+            + y_boost
+        )
+        candidate_contours.append({
+            'cnt': cnt,
+            'score': score,
+            'circularity': circularity,
+            'diameter_likelihood': diameter_likelihood,
+            'y_boost': y_boost,
+            'historyWeight': historyWeight,
+            'dist_norm': dist_norm,
+            'cx': cx,
+            'cy': cy,
+            'r': r
+        })
+        countoursCompletedLoop += 1
+        if score > best_score:
+            countourCorrectScore += 1
+            best_score = score
+            best_ball = (cx, cy, r)
+        # Passed all checks
+        contour_statuses.append((cnt, 'passed'))
+
+    # Color map for reasons
+    color_map = {
+        'wrong_area': (0, 0, 255),        # Red
+        'wrong_solidity': (255, 0, 255), # Magenta
+        'wrong_perimeter': (0, 255, 255),# Yellow
+        'wrong_circularity': (255, 0, 0),# Blue
+        'too_far': (0, 165, 255),        # Orange
+        'passed': (0, 255, 0),           # Green
+    }
+    # Draw contours with color depending on reason
+    for cnt, reason in contour_statuses:
+        color = color_map.get(reason, (200, 200, 200))
+        cv2.drawContours(mask_vis, [cnt], -1, color, 2)
+
+    # Draw score next to each candidate contour
+    for cand in candidate_contours:
+        text_pos = (int(cand['cx'] + cand['r'] + 10), int(cand['cy']))
+        cv2.putText(mask_vis, f"{cand['score']:.1f}", text_pos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
+
+    # Overlay breakdown for top 2 candidates: 1 left, 2 right
+    top_candidates = sorted(candidate_contours, key=lambda x: x['score'], reverse=True)[:2]
+    h, w = mask_vis.shape[:2]
+    for idx, cand in enumerate(top_candidates):
+        breakdown = [
+            f"Score breakdown for candidate {idx+1}:",
+            f"  WEIGHT_CIRCULARITY * circularity = {WEIGHT_CIRCULARITY:.1f} * {cand['circularity']:.2f} = {WEIGHT_CIRCULARITY * cand['circularity']:.2f}",
+            f"  - historyWeight * dist_norm * WEIGHT_HISTORY_DIST = -{cand['historyWeight']:.2f} * {cand['dist_norm']:.2f} * {WEIGHT_HISTORY_DIST:.2f} = {-cand['historyWeight'] * cand['dist_norm'] * WEIGHT_HISTORY_DIST:.2f}",
+            f"  WEIGHT_DIAMETER_LIKELIHOOD * diameter_likelihood = {WEIGHT_DIAMETER_LIKELIHOOD:.1f} * {cand['diameter_likelihood']:.2f} = {WEIGHT_DIAMETER_LIKELIHOOD * cand['diameter_likelihood']:.2f}",
+            f"  y_boost = {cand['y_boost']:.2f}",
+            f"  Total score = {cand['score']:.2f}"
+        ]
+        for line_num, line in enumerate(breakdown):
+            y_pos = 30 + line_num * 20
+            if idx == 0:
+                x_pos = 10  # left
+            else:
+                text_size = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                x_pos = w - text_size[0] - 10  # right
+            cv2.putText(mask_vis, line, (x_pos, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 255), 2, cv2.LINE_AA)
+    cv2.imshow("final_mask", mask_vis)
+    if debug:
+        print("number of contours", len(contours))
+
+    # Draw only the top 3 candidates by score and print their score/components
+    top_candidates = sorted(candidate_contours, key=lambda x: x['score'], reverse=True)[:3]
+    for idx, cand in enumerate(top_candidates):
+        cv2.drawContours(output, [cand['cnt']], -1, (0, 255, 255), 2)
+        # Draw score next to contour center
+        text_pos = (int(cand['cx'] + cand['r'] + 10), int(cand['cy']))
+        cv2.putText(output, f"{cand['score']:.1f}", text_pos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2, cv2.LINE_AA)
+    if debug:
+        print("countourWrongSize", countourWrongSize, "countoursWrongPerimeter", countoursWrongPerimeter,  "countourWrongSolidity", countourWrongSolidity, "countoursWrongCircularity", countoursWrongCircularity,"countoursCompletedLoop", countoursCompletedLoop, "countourCorrectScore", countourCorrectScore)
+    # Returner dict for best_ball, så contour kan tegnes
+    best_ball_dict = None
+    if candidate_contours:
+        best_cand = max(candidate_contours, key=lambda x: x['score'])
+        best_ball_dict = best_cand
+    return best_ball_dict
+
+
+def findBall(inputImage, last_ball, tracker, debug, adaptive, player_rect=None):
+    output = inputImage.copy()
+    hsv = cv2.cvtColor(inputImage, cv2.COLOR_BGR2HSV)
+    player_exclusion_mask = None
+    if player_rect is not None:
+        from utils import create_player_exclusion_mask
+        from config import PLAYER_MASK_MARGIN
+        player_exclusion_mask = create_player_exclusion_mask(inputImage.shape, player_rect, margin=PLAYER_MASK_MARGIN)
+
+    waterAndBackgroundAndMorphologyMask = createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask)
+    # Pass tracker (with diameter_history) to identifyContours for diameter likelihood scoring
+    best_ball = identifyContours(inputImage, waterAndBackgroundAndMorphologyMask, output, tracker, last_ball, False)
+    return output, best_ball
+
+
+def mouse_callback(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        print(f"Mouse click at: x={x}, y={y}")
+
+
+def enable_mouse_capture(window_name):
+    cv2.setMouseCallback(window_name, mouse_callback)
