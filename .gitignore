@@ -3,3 +3,5 @@
 *.mov
 *.mkv
 *.zip
+__pycache__/
+data/

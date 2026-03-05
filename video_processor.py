@@ -26,7 +26,21 @@ from config import (
 
 
 class VideoProcessor:
-    """Handles video reading, frame processing and user interaction."""
+
+    def calculate_iou(self, boxA, boxB):
+        # boxA and boxB: [x, y, w, h]
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+        interW = max(0, xB - xA)
+        interH = max(0, yB - yA)
+        interArea = interW * interH
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+        iou = interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0.0
+        return iou
+        """Handles video reading, frame processing and user interaction."""
 
     def __init__(self, video_path: str, play_speed: int = DEFAULT_PLAY_SPEED, start_frame: int = DEFAULT_START_FRAME):
         self.video_path = video_path
@@ -68,6 +82,22 @@ class VideoProcessor:
         cv2.setMouseCallback(window_name, self.mouse_callback)
 
     def run(self):
+        import os, json
+        # Indlæs COCO-annotationer én gang
+        coco_path = os.path.join(os.path.dirname(__file__), 'instances_Train.json')
+        if os.path.exists(coco_path):
+            with open(coco_path, 'r', encoding='utf-8') as f:
+                coco_data = json.load(f)
+            # Lav opslag fra image_id til bbox
+            coco_ann = {}
+            for ann in coco_data.get('annotations', []):
+                img_id = ann.get('image_id')
+                bbox = ann.get('bbox')
+                if img_id is not None and bbox:
+                    coco_ann[img_id] = bbox
+        else:
+            coco_ann = {}
+
         success = True
         while success:
             start = time.time()
@@ -149,7 +179,6 @@ class VideoProcessor:
 
                 # Tegn best_ball contour hvis den findes
                 if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
-                    print("drawing best ball circles")
                     center = (int(best_ball['cx']), int(best_ball['cy']))
                     radius = int(best_ball['r'])
                     cv2.circle(output, center, max(radius-2,1), (255, 0, 0), 2)   # r-1, rød
@@ -158,6 +187,22 @@ class VideoProcessor:
 
                 if player_rect is not None:
                     cv2.drawContours(output, [player_rect], -1, (255, 0, 0), 2)
+
+                # Draw purple rectangle for ground truth ball location from COCO annotation
+                frame_id = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
+                if frame_id in coco_ann:
+                    bbox = coco_ann[frame_id]
+                    x, y, w, h = map(int, bbox)
+                    cv2.rectangle(output, (x, y), (x + w, y + h), (255, 0, 255), 2)
+                    # If best_ball exists, calculate IoU and print to terminal
+                    if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
+                        det_x = int(best_ball['cx'] - best_ball['r'])
+                        det_y = int(best_ball['cy'] - best_ball['r'])
+                        det_w = int(2 * best_ball['r'])
+                        det_h = int(2 * best_ball['r'])
+                        det_bbox = [det_x, det_y, det_w, det_h]
+                        iou = self.calculate_iou(det_bbox, [x, y, w, h])
+                        print(f"Frame {frame_id}: IoU={iou:.3f}")
 
                 cv2.imshow('frame output', output)
                 self.enable_mouse_capture('frame output')
