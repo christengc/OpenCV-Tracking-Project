@@ -1,6 +1,6 @@
 # Performance mode: hvis True, undgå dyre operationer som set(cv2.CAP_PROP_POS_FRAMES)
 PERFORMANCE_MODE = False
-DEBUG_FLAG = True
+DEBUG_FLAG = False
 """Global configuration and default constants used throughout the tracker.
 
 Putting hard‑coded numbers in a central module makes it easier to tune
@@ -19,6 +19,8 @@ MAX_JUMP_PIXELS = 1000          # maximum allowed jump for candidate contour
 
 # contours and mask
 COLOR_SIMILARITY_TOLERANCE = 20  # tolerance for R/G/B channel differences
+SOLIDITY_MIN = 0.80              # minimum contour solidity (0-1)
+
 
 # water/mirror mask thresholds (HSV)
 WATER_LOWER = (80, 20, 50)
@@ -32,9 +34,9 @@ TRACKBAR_SETTINGS = {
     "S max": (65, 255),
     "V min": (0, 255),
     "V max": (255, 255),
-    "circularity": (67, 100),
-    "Size min": (50, 5000),
-    "Size Max": (4000, 90000),
+    "circularity": (72, 100),
+    "Size min": (132, 5000),
+    "Size Max": (4000, 36000),
 }
 
 # scene classification ranges (HSV)

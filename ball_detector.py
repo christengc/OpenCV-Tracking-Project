@@ -8,6 +8,7 @@ from config import (
     WATER_UPPER,
     COLOR_SIMILARITY_TOLERANCE,
     MAX_JUMP_PIXELS,
+    SOLIDITY_MIN,
 )
 
 # morphological kernel used by mask creation
@@ -84,7 +85,6 @@ def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=Non
         final_mask = cv2.bitwise_and(combined_graphics_dilate, player_exclusion_mask)
     else:
         final_mask = combined_graphics_dilate
-    cv2.imshow('combined_graphics_dilate', combined_graphics_dilate)
 
     from config import GRASS_LOWER, GRASS_UPPER, CLASSIFY_GRASS_MIN_PERCENT
     grass_mask = cv2.inRange(hsv, GRASS_LOWER, GRASS_UPPER)
@@ -170,7 +170,7 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
             solidity = 0
         # Solidity check
         if check_solidity:
-            if solidity < 0.8:
+            if solidity < SOLIDITY_MIN:
                 countourWrongSolidity += 1
                 contour_statuses.append((cnt, 'wrong_solidity'))
                 continue
@@ -182,7 +182,6 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         circularity = 4 * np.pi * area / (perimeter * perimeter)
         # Circularity check
         if check_circularity:
-            print("circularity:", circularity, "limit:", circularityLimit)
             if circularity < circularityLimit:
                 countoursWrongCircularity += 1
                 contour_statuses.append((cnt, 'wrong_circularity'))
@@ -287,7 +286,7 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         print(
             f"[identifyContours] found={len(contours)} | "
             f"checks(area={check_area}, solidity={check_solidity}, circularity={check_circularity}, dist={check_dist}) | "
-            f"limits(size=[{sizeMinLimit},{sizeMaxLimit}], circ>={circularityLimit:.2f}, solidity>=0.80, max_jump={MAX_JUMP_PIXELS}) | "
+            f"limits(size=[{sizeMinLimit},{sizeMaxLimit}], circ>={circularityLimit:.2f}, solidity>={SOLIDITY_MIN:.2f}, max_jump={MAX_JUMP_PIXELS}) | "
             f"filtered(area={countourWrongSize}, solidity={countourWrongSolidity}, perimeter={countoursWrongPerimeter}, "
             f"circularity={countoursWrongCircularity}, too_far={too_far_count}) | "
             f"remaining={len(candidate_contours)} scores={passed_scores}"

@@ -64,6 +64,7 @@ class VideoProcessor:
         self.framesWithoutBall = 0
         self.previous_frame = None
         self.frameCount = 0
+        self.stop_requested = False
 
         # set initial position
         from config import PERFORMANCE_MODE
@@ -84,7 +85,12 @@ class VideoProcessor:
         cv2.setMouseCallback(window_name, self.mouse_callback)
 
     def run(self):
+        self.stop_requested = False
         evaluation = EvaluationClass()
+        found_ball_frames = 0
+        iou_evaluated_frames = 0
+        iou_match_frames = 0
+        grass_or_blue_frames = 0
         import os, json
         # Indlæs COCO-annotationer én gang
         coco_path = os.path.join(os.path.dirname(__file__), 'instances_Train.json')
@@ -149,6 +155,8 @@ class VideoProcessor:
                 player_rect = None
                 scene_type = classification_result.get("classification")
                 allow_tracking = scene_type in ["grass", "blue_sky"]
+                if allow_tracking:
+                    grass_or_blue_frames += 1
                 actual_ball_diameter_pixels = None
                 if allow_tracking:
                     t51 = time.time()
@@ -198,6 +206,7 @@ class VideoProcessor:
                         self.diameter_diffs.append(estimated_ball_diameter_pixels - actual_ball_diameter_pixels)
 
                 if best_ball is not None:
+                    found_ball_frames += 1
                     self.golfBall.addData({'x': best_ball['cx'], 'y': best_ball['cy']})
                 else:
                     self.golfBall.addData(None)
@@ -213,7 +222,6 @@ class VideoProcessor:
 
                 # Tegn best_ball contour hvis den findes
                 if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
-                    print(f"Best ball detected at (x={best_ball['cx']}, y={best_ball['cy']}), radius={best_ball['r']}")
                     center = (int(best_ball['cx']), int(best_ball['cy']))
                     radius = int(best_ball['r'])
                     cv2.circle(output, center, max(radius-2,1), (255, 0, 0), 2)   # r-1, rød
@@ -237,6 +245,9 @@ class VideoProcessor:
                         det_h = int(2 * best_ball['r'])
                         det_bbox = [det_x, det_y, det_w, det_h]
                         iou = self.calculate_iou(det_bbox, [x, y, w, h])
+                        iou_evaluated_frames += 1
+                        if iou > 0.5:
+                            iou_match_frames += 1
                         evaluation.add_iou(iou)
 
                 t9 = time.time()
@@ -254,7 +265,18 @@ class VideoProcessor:
 
             processed_frames += 1
             if self.max_frames is not None and processed_frames >= self.max_frames:
+                current_pos = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
+                print(f"[STOP] reason=processed_frames_limit processed={processed_frames} video_frame={current_pos} max_frames={self.max_frames}")
                 break
+
+            # Also stop by actual video frame index to guarantee deterministic
+            # cut-off for parameter sweeps (e.g. first 4000 frames).
+            if self.max_frames is not None:
+                current_pos = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
+                processed_video_span = current_pos - int(self.start_frame_number)
+                if processed_video_span >= self.max_frames:
+                    print(f"[STOP] reason=video_frame_limit processed={processed_frames} video_frame={current_pos} span={processed_video_span} max_frames={self.max_frames}")
+                    break
 
             key = cv2.waitKey(WAIT_KEY_DELAY_MS) & 0xFF
             control_result = handle_keyboard_controls(
@@ -272,9 +294,31 @@ class VideoProcessor:
             self.adaptive = control_result["adaptive"]
 
             if control_result["should_break"]:
+                self.stop_requested = True
                 break
 
         self.vid.release()
         cv2.destroyAllWindows()
         # Print summary score after video ends
-        print(f"\nSummary IoU score: {evaluation.summary_score():.3f}")
+        final_score = evaluation.summary_score()
+        print(f"\nSummary IoU score: {final_score:.3f}")
+        final_video_frame = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
+        total_video_frames = max(0, final_video_frame - int(self.start_frame_number))
+        run_metrics = {
+            "summary_iou": final_score,
+            "total_video_frames": total_video_frames,
+            "processed_loop_frames": processed_frames,
+            "found_ball_frames": found_ball_frames,
+            "iou_evaluated_frames": iou_evaluated_frames,
+            "iou_match_frames": iou_match_frames,
+            "grass_or_blue_frames": grass_or_blue_frames,
+            "stop_requested": self.stop_requested,
+        }
+        print(
+            "[RUN METRICS] "
+            f"total_video_frames={run_metrics['total_video_frames']} | "
+            f"found_ball={run_metrics['found_ball_frames']} | "
+            f"iou_match_gt_0.5={run_metrics['iou_match_frames']} | "
+            f"grass_or_blue={run_metrics['grass_or_blue_frames']}"
+        )
+        return run_metrics
