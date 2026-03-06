@@ -99,6 +99,7 @@ def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=Non
 
 
 def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
+    from config import WEIGHT_Y_BOOST
     # Cache trackbar values for performance
     trackbar_values = {
         "check_area": cv2.getTrackbarPos("Area", "Controls") == 1,
@@ -122,7 +123,6 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
     WEIGHT_CIRCULARITY = 8.0
     WEIGHT_HISTORY_DIST = 0.1
     WEIGHT_DIAMETER_LIKELIHOOD = 6.0
-    WEIGHT_Y_BOOST = 25.0
 
     contours, _ = cv2.findContours(binaryMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     # Visualize contours in the mask image

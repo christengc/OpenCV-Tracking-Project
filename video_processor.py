@@ -91,21 +91,33 @@ class VideoProcessor:
         iou_evaluated_frames = 0
         iou_match_frames = 0
         grass_or_blue_frames = 0
+        no_label_frames = 0
+        no_label_tracked_ball_frames = 0
+        no_label_skipped_background_frames = 0
         import os, json
-        # Indlæs COCO-annotationer én gang
-        coco_path = os.path.join(os.path.dirname(__file__), 'instances_Train.json')
+        # Indlæs COCO-annotationer én gang fra split/outline labels
+        coco_path = os.path.join(os.path.dirname(__file__), 'coco splitandoutline.json')
         if os.path.exists(coco_path):
             with open(coco_path, 'r', encoding='utf-8') as f:
                 coco_data = json.load(f)
-            # Lav opslag fra image_id til bbox
+            # Lav opslag fra image_id til labelinfo (bbox + occluded)
             coco_ann = {}
             for ann in coco_data.get('annotations', []):
                 img_id = ann.get('image_id')
                 bbox = ann.get('bbox')
+                attributes = ann.get('attributes') or {}
+                occluded = bool(attributes.get('occluded', False))
                 if img_id is not None and bbox:
-                    coco_ann[img_id] = bbox
+                    existing = coco_ann.get(img_id)
+                    if existing is None or (existing.get('occluded', True) and not occluded):
+                        coco_ann[img_id] = {
+                            'bbox': bbox,
+                            'occluded': occluded,
+                        }
+            print(f"[LABELS] using={os.path.basename(coco_path)} annotations={len(coco_ann)}")
         else:
             coco_ann = {}
+            print(f"[LABELS] missing required file: {os.path.basename(coco_path)}")
 
         success = True
         processed_frames = 0
@@ -233,8 +245,11 @@ class VideoProcessor:
 
                 # Draw purple rectangle for ground truth ball location from COCO annotation
                 frame_id = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
-                if frame_id in coco_ann:
-                    bbox = coco_ann[frame_id]
+                label_info = coco_ann.get(frame_id)
+                is_occluded_label = label_info is not None and label_info.get('occluded', False)
+                has_valid_label = label_info is not None and not is_occluded_label
+                if has_valid_label:
+                    bbox = label_info['bbox']
                     x, y, w, h = map(int, bbox)
                     cv2.rectangle(output, (x, y), (x + w, y + h), (255, 0, 255), 2)
                     # If best_ball exists, calculate IoU and print to terminal
@@ -249,6 +264,12 @@ class VideoProcessor:
                         if iou > 0.5:
                             iou_match_frames += 1
                         evaluation.add_iou(iou)
+                else:
+                    no_label_frames += 1
+                    if best_ball is not None:
+                        no_label_tracked_ball_frames += 1
+                    elif not allow_tracking:
+                        no_label_skipped_background_frames += 1
 
                 t9 = time.time()
                 cv2.imshow('frame output', output)
@@ -312,6 +333,9 @@ class VideoProcessor:
             "iou_evaluated_frames": iou_evaluated_frames,
             "iou_match_frames": iou_match_frames,
             "grass_or_blue_frames": grass_or_blue_frames,
+            "no_label_frames": no_label_frames,
+            "no_label_tracked_ball_frames": no_label_tracked_ball_frames,
+            "no_label_skipped_background_frames": no_label_skipped_background_frames,
             "stop_requested": self.stop_requested,
         }
         print(
@@ -319,6 +343,9 @@ class VideoProcessor:
             f"total_video_frames={run_metrics['total_video_frames']} | "
             f"found_ball={run_metrics['found_ball_frames']} | "
             f"iou_match_gt_0.5={run_metrics['iou_match_frames']} | "
-            f"grass_or_blue={run_metrics['grass_or_blue_frames']}"
+            f"grass_or_blue={run_metrics['grass_or_blue_frames']} | "
+            f"no_label={run_metrics['no_label_frames']} | "
+            f"no_label_tracked_ball={run_metrics['no_label_tracked_ball_frames']} | "
+            f"no_label_bg_skipped={run_metrics['no_label_skipped_background_frames']}"
         )
         return run_metrics
