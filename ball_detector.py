@@ -9,6 +9,7 @@ from config import (
     COLOR_SIMILARITY_TOLERANCE,
     MAX_JUMP_PIXELS,
     SOLIDITY_MIN,
+    KNN_DISTANCE_THRESHOLD,
 )
 
 # morphological kernel used by mask creation
@@ -30,7 +31,7 @@ def _preprocess_patch_for_knn(patch, patch_size=20):
     return normalized.reshape(-1)
 
 
-def _classify_contour_patch_knn(inputImage, cx, cy, knn_model, patch_size=20):
+def _classify_contour_patch_knn(inputImage, cx, cy, knn_model, patch_size=20, distance_threshold=KNN_DISTANCE_THRESHOLD):
     """Classify contour-centered patch with trained KNN model."""
     if knn_model is None:
         if not hasattr(_classify_contour_patch_knn, "_warned_no_model"):
@@ -46,7 +47,15 @@ def _classify_contour_patch_knn(inputImage, cx, cy, knn_model, patch_size=20):
         return False
     try:
         pred = knn_model.predict([features])
-        return bool(pred[0])
+        if not bool(pred[0]):
+            return False
+
+        # Distance gate to suppress weak/ambiguous positives.
+        dist, ind = knn_model.kneighbors([features], n_neighbors=1)
+        if float(dist[0][0]) > float(distance_threshold):
+            return False
+
+        return True
     except Exception as exc:
         if not hasattr(_classify_contour_patch_knn, "_warned_predict_error"):
             print(f"[KNN] predict failed in contour classification: {exc}")
@@ -193,7 +202,21 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
     candidate_contours = []
     # For color-coding: store tuples (cnt, reason)
     contour_statuses = []
+    knn_positive_contours = []
     for cnt in contours:
+        # Run KNN on every contour before geometric filtering.
+        (x, y), r = cv2.minEnclosingCircle(cnt)
+        cx, cy = x, y
+        knn_is_ball = _classify_contour_patch_knn(
+            inputImage,
+            cx,
+            cy,
+            getattr(tracker, 'knn_model', None),
+            patch_size=20,
+        )
+        if knn_is_ball:
+            knn_positive_contours.append(cnt)
+
         area = cv2.contourArea(cnt)
         # Area check
         if check_area:
@@ -225,8 +248,6 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
                 countoursWrongCircularity += 1
                 contour_statuses.append((cnt, 'wrong_circularity'))
                 continue
-        (x, y), r = cv2.minEnclosingCircle(cnt)
-        cx, cy = x, y
         diameter = r * 2
         diameter_likelihood = np.exp(-((diameter - mean_diam) ** 2.0) / (2.0 * std_diam ** 2.0))
         if last_ball is not None and isinstance(last_ball, dict):
@@ -251,7 +272,6 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         )
 
         # Optional ML vote: boost score if contour-centered patch is classified as ball.
-        knn_is_ball = _classify_contour_patch_knn(inputImage, cx, cy, getattr(tracker, 'knn_model', None), patch_size=20)
         if knn_is_ball:
             score += 1.0
             print(f"Contour at ({cx:.1f}, {cy:.1f}) classified as ball by KNN, boosting score to {score:.2f}")
@@ -295,6 +315,12 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
             x, y, w, h = cv2.boundingRect(cnt)
             cv2.putText(mask_vis, "knn", (x + w + 6, max(20, y + h // 2)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
+    # Draw knn label for all KNN-positive contours (also filtered-out ones).
+    for cnt in knn_positive_contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        cv2.putText(mask_vis, "knn", (x + w + 6, max(20, y + h // 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
     # Draw score next to each candidate contour
     for cand in candidate_contours:

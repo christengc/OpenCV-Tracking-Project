@@ -15,12 +15,12 @@ SCENE_SHIFT_THRESHOLD = 40.0
 
 # tracker behaviour
 MAX_FRAMES_WITHOUT_BALL = 10    # after this many frames the previous ball is forgotten
-MAX_JUMP_PIXELS = 150          # maximum allowed jump for candidate contour
+MAX_JUMP_PIXELS = 1500          # maximum allowed jump for candidate contour
 WEIGHT_Y_BOOST = 25.0           # score boost for lower-half contours
 
 # contours and mask
 COLOR_SIMILARITY_TOLERANCE = 20  # tolerance for R/G/B channel differences
-SOLIDITY_MIN = 0.92              # minimum contour solidity (0-1)
+SOLIDITY_MIN = 0.80              # minimum contour solidity (0-1)
 
 
 # water/mirror mask thresholds (HSV)

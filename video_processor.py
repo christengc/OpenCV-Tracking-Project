@@ -23,6 +23,8 @@ from config import (
     WAIT_KEY_DELAY_MS,
     SCENE_SHIFT_THRESHOLD,
     MAX_FRAMES_WITHOUT_BALL,
+    KNN_DISTANCE_QUANTILE,
+    KNN_DISTANCE_MARGIN,
 )
 import config
 
@@ -80,6 +82,7 @@ class VideoProcessor:
         self.knn_model = None
         self.knn_train_features = None
         self.knn_train_labels = None
+        self.knn_distance_threshold = None
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -121,6 +124,20 @@ class VideoProcessor:
         knn = KNeighborsClassifier(n_neighbors=5)
         knn.fit(X_train, y_train)
 
+        # Estimate a practical distance threshold from positive samples.
+        pos_idx = np.where(y_train == 1)[0]
+        if pos_idx.size >= 2:
+            pos_X = X_train[pos_idx]
+            pos_dists, _ = knn.kneighbors(pos_X, n_neighbors=2)
+            nearest_nonself = pos_dists[:, 1]
+            distance_threshold = float(np.quantile(nearest_nonself, KNN_DISTANCE_QUANTILE) * KNN_DISTANCE_MARGIN)
+        elif pos_idx.size == 1:
+            pos_X = X_train[pos_idx]
+            pos_dists, _ = knn.kneighbors(pos_X, n_neighbors=1)
+            distance_threshold = float(pos_dists[0, 0] * KNN_DISTANCE_MARGIN)
+        else:
+            distance_threshold = None
+
         train_pred = knn.predict(X_train)
         train_acc = float(np.mean(train_pred == y_train)) if y_train.size > 0 else 0.0
         train_pos_pred = int(np.sum(train_pred == 1))
@@ -128,6 +145,8 @@ class VideoProcessor:
         self.knn_model = knn
         self.knn_train_features = X_train
         self.knn_train_labels = y_train
+        self.knn_distance_threshold = distance_threshold
+        setattr(self.knn_model, "distance_threshold", distance_threshold)
 
         print(
             f"KNN data shape: X={X_train.shape}, y={y_train.shape}, "
@@ -137,6 +156,10 @@ class VideoProcessor:
             f"KNN training sanity: accuracy={train_acc:.3f}, "
             f"predicted_ones={train_pos_pred}"
         )
+        if distance_threshold is not None:
+            print(f"KNN distance threshold: {distance_threshold:.3f}")
+        else:
+            print("KNN distance threshold: disabled (insufficient positive samples)")
         print("Training complete")
 
     def run(self):
