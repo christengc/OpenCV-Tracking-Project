@@ -14,6 +14,7 @@ from utils import (
     removeComputerGraphics,
     initialize_controls,
     detect_players,
+    collect_annotation_and_random_patch_features,
 )
 from evaluation_class import EvaluationClass
 from config import (
@@ -76,6 +77,9 @@ class VideoProcessor:
         self.actual_diameters = []
         self.diameter_diffs = []
         self.diameter_history = []  # For diameter likelihood scoring
+        self.knn_model = None
+        self.knn_train_features = None
+        self.knn_train_labels = None
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -83,6 +87,57 @@ class VideoProcessor:
 
     def enable_mouse_capture(self, window_name):
         cv2.setMouseCallback(window_name, self.mouse_callback)
+
+    def initialize_knn_model(self, coco_ann, max_frames=2000, patch_size=20):
+        """Build training data from annotation/random patches and train KNN."""
+        try:
+            import importlib
+            sklearn_neighbors = importlib.import_module("sklearn.neighbors")
+            KNeighborsClassifier = getattr(sklearn_neighbors, "KNeighborsClassifier")
+        except ImportError:
+            print("KNN init skipped: scikit-learn is not installed")
+            self.knn_model = None
+            return
+
+        feature_matrix, label_vector = collect_annotation_and_random_patch_features(
+            self.vid,
+            coco_ann,
+            start_frame=self.start_frame_number,
+            max_frames=max_frames,
+            patch_size=patch_size,
+            random_seed=0,
+        )
+
+        if feature_matrix.shape[1] == 0 or label_vector.size == 0:
+            print("KNN init skipped: no training samples collected")
+            self.knn_model = None
+            self.knn_train_features = feature_matrix
+            self.knn_train_labels = label_vector
+            return
+
+        X_train = feature_matrix.T
+        y_train = label_vector
+
+        knn = KNeighborsClassifier(n_neighbors=5)
+        knn.fit(X_train, y_train)
+
+        train_pred = knn.predict(X_train)
+        train_acc = float(np.mean(train_pred == y_train)) if y_train.size > 0 else 0.0
+        train_pos_pred = int(np.sum(train_pred == 1))
+
+        self.knn_model = knn
+        self.knn_train_features = X_train
+        self.knn_train_labels = y_train
+
+        print(
+            f"KNN data shape: X={X_train.shape}, y={y_train.shape}, "
+            f"class_balance=(ones={int(np.sum(y_train == 1))}, zeros={int(np.sum(y_train == 0))})"
+        )
+        print(
+            f"KNN training sanity: accuracy={train_acc:.3f}, "
+            f"predicted_ones={train_pos_pred}"
+        )
+        print("Training complete")
 
     def run(self):
         self.stop_requested = False
@@ -141,6 +196,12 @@ class VideoProcessor:
         else:
             coco_ann = {}
             print(f"[LABELS] missing required file: {os.path.basename(coco_path)}")
+
+        self.initialize_knn_model(
+            coco_ann,
+            max_frames=2000,
+            patch_size=20,
+        )
 
         success = True
         processed_frames = 0
@@ -448,45 +509,5 @@ class VideoProcessor:
             "no_label_skipped_background_frames": no_label_skipped_background_frames,
             "stop_requested": self.stop_requested,
         }
-        print(
-            "[RUN METRICS] "
-            f"total_video_frames={run_metrics['total_video_frames']} | "
-            f"found_ball={run_metrics['found_ball_frames']} | "
-            f"grass_or_blue={run_metrics['grass_or_blue_frames']}"
-        )
-        print("[RUN METRICS HIERARCHY]")
-        print(f"  1a no_label={run_metrics['no_label_frames']}")
-        print(f"    1a1 tracked={run_metrics['no_label_tracked_ball_frames']}")
-        print(f"    1a2 not_tracked={run_metrics['no_label_not_tracked_frames']}")
-        print(
-            f"      reasons: background_classification={run_metrics['no_label_not_tracked_background_frames']}, "
-            f"detector_no_ball_found={run_metrics['no_label_not_tracked_detector_frames']}"
-        )
-        print(
-            f"        detector subreasons: no_contours={run_metrics['no_label_detector_no_contours_frames']}, "
-            f"filtered_area={run_metrics['no_label_detector_filtered_area_frames']}, "
-            f"filtered_solidity={run_metrics['no_label_detector_filtered_solidity_frames']}, "
-            f"filtered_circularity={run_metrics['no_label_detector_filtered_circularity_frames']}, "
-            f"filtered_perimeter={run_metrics['no_label_detector_filtered_perimeter_frames']}, "
-            f"filtered_distance={run_metrics['no_label_detector_filtered_distance_frames']}, "
-            f"other={run_metrics['no_label_detector_other_frames']}"
-        )
-        print(f"  1b label={run_metrics['label_frames']}")
-        print(f"    1b1 tracked={run_metrics['label_tracked_frames']}")
-        print(f"      1b1a IoU>0.5={run_metrics['iou_match_frames']}")
-        print(f"      1b1b low_or_no_score={run_metrics['iou_low_or_no_score_frames']}")
-        print(f"    1b2 not_tracked={run_metrics['label_not_tracked_frames']}")
-        print(
-            f"      reasons: background_classification={run_metrics['label_not_tracked_background_frames']}, "
-            f"detector_no_ball_found={run_metrics['label_not_tracked_detector_frames']}"
-        )
-        print(
-            f"        detector subreasons: no_contours={run_metrics['label_detector_no_contours_frames']}, "
-            f"filtered_area={run_metrics['label_detector_filtered_area_frames']}, "
-            f"filtered_solidity={run_metrics['label_detector_filtered_solidity_frames']}, "
-            f"filtered_circularity={run_metrics['label_detector_filtered_circularity_frames']}, "
-            f"filtered_perimeter={run_metrics['label_detector_filtered_perimeter_frames']}, "
-            f"filtered_distance={run_metrics['label_detector_filtered_distance_frames']}, "
-            f"other={run_metrics['label_detector_other_frames']}"
-        )
+
         return run_metrics

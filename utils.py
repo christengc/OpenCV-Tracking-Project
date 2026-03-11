@@ -311,6 +311,139 @@ def create_player_exclusion_mask(frame_shape, player_rect, margin=20):
     return mask
 
 
+def preprocess_patch(patch, patch_size=20):
+    """Convert a patch to flattened normalized features for ML models."""
+    if patch is None:
+        return None
+
+    if patch.ndim == 3:
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = patch
+
+    if gray.shape != (patch_size, patch_size):
+        gray = cv2.resize(gray, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    normalized = cv2.normalize(blurred, None, 0, 255, cv2.NORM_MINMAX)
+    return normalized.reshape(-1)
+
+
+def collect_annotation_and_random_patch_features(
+    video_capture,
+    coco_ann,
+    start_frame=1,
+    max_frames=2000,
+    patch_size=20,
+    random_seed=0,
+):
+    """Collect paired annotation/random patch features and labels.
+
+    For each frame (up to ``max_frames`` from ``start_frame``), if an
+    annotation exists, collect two ``patch_size x patch_size`` patches:
+    1) annotation-centered patch (label 1)
+    2) random patch that does not overlap the annotation bbox (label 0)
+
+    Each patch is transformed by:
+    grayscale -> Gaussian blur -> brightness normalization -> flatten.
+
+    Returns:
+        feature_matrix: np.ndarray with shape (patch_size*patch_size, n_samples)
+        labels: np.ndarray with shape (n_samples,), containing 1/0 values in the
+            same column order as feature_matrix.
+    """
+    feature_len = patch_size * patch_size
+    feature_columns = []
+    labels = []
+    half = patch_size // 2
+    rng = np.random.default_rng(random_seed)
+
+    def _to_feature_column(patch_bgr):
+        gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        normalized = cv2.normalize(blurred, None, 0, 255, cv2.NORM_MINMAX)
+        return normalized.reshape(feature_len, 1).astype(np.uint8)
+
+    def _extract_center_patch(frame, bbox):
+        x, y, w, h = [float(v) for v in bbox[:4]]
+        cx = int(round(x + w / 2.0))
+        cy = int(round(y + h / 2.0))
+        padded = cv2.copyMakeBorder(
+            frame, half, half, half, half, cv2.BORDER_REFLECT_101
+        )
+        px = cx + half
+        py = cy + half
+        patch = padded[py - half:py + half, px - half:px + half]
+        if patch.shape[:2] != (patch_size, patch_size):
+            patch = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
+        return patch
+
+    def _overlaps_bbox(px, py, bbox):
+        x, y, w, h = [float(v) for v in bbox[:4]]
+        return not (px + patch_size <= x or px >= x + w or py + patch_size <= y or py >= y + h)
+
+    def _extract_random_non_overlap_patch(frame, bbox, max_attempts=200):
+        h, w = frame.shape[:2]
+        if w < patch_size or h < patch_size:
+            return None
+        max_x = w - patch_size
+        max_y = h - patch_size
+        for _ in range(max_attempts):
+            px = int(rng.integers(0, max_x + 1))
+            py = int(rng.integers(0, max_y + 1))
+            if _overlaps_bbox(px, py, bbox):
+                continue
+            return frame[py:py + patch_size, px:px + patch_size]
+        return None
+
+    original_pos = int(video_capture.get(cv2.CAP_PROP_POS_FRAMES))
+    first_idx = max(0, int(start_frame) - 1)
+    video_capture.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+
+    for _ in range(max_frames):
+        ok, frame = video_capture.read()
+        if not ok:
+            break
+
+        frame_id = int(video_capture.get(cv2.CAP_PROP_POS_FRAMES))
+        ann_entry = coco_ann.get(frame_id)
+        if ann_entry is None:
+            continue
+
+        if isinstance(ann_entry, dict):
+            candidates = [ann_entry]
+        else:
+            candidates = [a for a in ann_entry if isinstance(a, dict)]
+
+        bbox = None
+        for ann in candidates:
+            b = ann.get("bbox")
+            if b is not None and len(b) >= 4:
+                bbox = b
+                break
+        if bbox is None:
+            continue
+
+        ann_patch = _extract_center_patch(frame, bbox)
+        rand_patch = _extract_random_non_overlap_patch(frame, bbox)
+        if rand_patch is None:
+            continue
+
+        feature_columns.append(_to_feature_column(ann_patch))
+        labels.append(1)
+        feature_columns.append(_to_feature_column(rand_patch))
+        labels.append(0)
+
+    video_capture.set(cv2.CAP_PROP_POS_FRAMES, original_pos)
+
+    if not feature_columns:
+        return np.empty((feature_len, 0), dtype=np.uint8), np.empty((0,), dtype=np.uint8)
+
+    feature_matrix = np.hstack(feature_columns)
+    label_vector = np.array(labels, dtype=np.uint8)
+    return feature_matrix, label_vector
+
+
 def detect_graphics_rectangles(frame):
     """Detect computer graphics (rectangular UI elements) in the frame.
 
