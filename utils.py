@@ -275,38 +275,11 @@ def detect_players(frame):
     detect_players._frame_counter += 1
 
     if DETECTION_METHOD == "yolov8":
-        # Kør YOLOv8 kun på hver tredje frame
-        if detect_players._frame_counter % 3 == 1:
-            result = detect_players_yolov8(frame)
-            detect_players._prev_contours = detect_players._last_contours
-            detect_players._last_contours = result
-            contours = result
-        else:
-            # Interpolér position hvis muligt
-            if detect_players._prev_contours is not None and detect_players._last_contours is not None:
-                # For simplicity: lineær interpolation af bounding box for største contour
-                def contour_center(contour):
-                    M = cv2.moments(contour)
-                    if M["m00"] == 0:
-                        return (0, 0)
-                    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-                prev = detect_players._prev_contours
-                last = detect_players._last_contours
-                if prev and last:
-                    prev_c = max(prev, key=cv2.contourArea)
-                    last_c = max(last, key=cv2.contourArea)
-                    c0 = contour_center(prev_c)
-                    c1 = contour_center(last_c)
-                    interp_c = (int((c0[0]+c1[0])/2), int((c0[1]+c1[1])/2))
-                    # Flyt hele contour til interpoleret center
-                    dx = interp_c[0] - c1[0]
-                    dy = interp_c[1] - c1[1]
-                    interp_contour = last_c + np.array([[[dx, dy]]])
-                    contours = [interp_contour]
-                else:
-                    contours = detect_players._last_contours if detect_players._last_contours is not None else []
-            else:
-                contours = detect_players._last_contours if detect_players._last_contours is not None else []
+        # Kør YOLOv8 på hver frame.
+        result = detect_players_yolov8(frame)
+        detect_players._prev_contours = detect_players._last_contours
+        detect_players._last_contours = result
+        contours = result
     else:
         result = detect_players_hog(frame)
         contours = result
@@ -330,7 +303,7 @@ def create_player_exclusion_mask(frame_shape, player_rect, margin=20):
     mask = np.ones((frame_shape[0], frame_shape[1]), dtype=np.uint8) * 255
     if player_rect is not None:
         # player_rect is now a contour
-        shrink_kernel = np.ones((10, 10), np.uint8)
+        shrink_kernel = np.ones((13, 13), np.uint8)
         contour_mask = np.zeros((frame_shape[0], frame_shape[1]), dtype=np.uint8)
         cv2.drawContours(contour_mask, [player_rect], -1, 255, -1)
         contour_mask = cv2.erode(contour_mask, shrink_kernel, iterations=1)

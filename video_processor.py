@@ -91,8 +91,31 @@ class VideoProcessor:
         iou_evaluated_frames = 0
         iou_match_frames = 0
         grass_or_blue_frames = 0
+        label_frames = 0
+        label_tracked_frames = 0
+        label_not_tracked_frames = 0
+        iou_low_or_no_score_frames = 0
         no_label_frames = 0
         no_label_tracked_ball_frames = 0
+        no_label_not_tracked_frames = 0
+        no_label_not_tracked_background_frames = 0
+        no_label_not_tracked_detector_frames = 0
+        no_label_detector_no_contours_frames = 0
+        no_label_detector_filtered_area_frames = 0
+        no_label_detector_filtered_solidity_frames = 0
+        no_label_detector_filtered_circularity_frames = 0
+        no_label_detector_filtered_perimeter_frames = 0
+        no_label_detector_filtered_distance_frames = 0
+        no_label_detector_other_frames = 0
+        label_detector_no_contours_frames = 0
+        label_detector_filtered_area_frames = 0
+        label_detector_filtered_solidity_frames = 0
+        label_detector_filtered_circularity_frames = 0
+        label_detector_filtered_perimeter_frames = 0
+        label_detector_filtered_distance_frames = 0
+        label_detector_other_frames = 0
+        label_not_tracked_background_frames = 0
+        label_not_tracked_detector_frames = 0
         no_label_skipped_background_frames = 0
         import os, json
         # Indlæs COCO-annotationer én gang fra split/outline labels
@@ -131,7 +154,8 @@ class VideoProcessor:
             if not self.paused:
                 from config import PERFORMANCE_MODE
                 if not PERFORMANCE_MODE:
-                    self.vid.set(cv2.CAP_PROP_POS_FRAMES, currentFrameNumber)
+                    target_frame = max(0, int(lastFrameNumber + self.play_speed - 1))
+                    self.vid.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 success, image = self.vid.read()
             else:
                 image = None
@@ -192,6 +216,7 @@ class VideoProcessor:
                     )
                     output = findball_result['output']
                     best_ball = findball_result['best_ball']
+                    detector_diagnostics = findball_result.get('diagnostics')
                     t61b = time.time()
                     # Get actual ball diameter from best_ball if available
                     if best_ball is not None and 'r' in best_ball:
@@ -203,6 +228,7 @@ class VideoProcessor:
                 else:
                     output = image.copy()
                     best_ball = None
+                    detector_diagnostics = None
                 t7 = time.time()
                 output = self.sceneCalculator.draw_frame_type_indicator(output, classification_result)
                 t8 = time.time()
@@ -248,12 +274,30 @@ class VideoProcessor:
                 label_info = coco_ann.get(frame_id)
                 is_occluded_label = label_info is not None and label_info.get('occluded', False)
                 has_valid_label = label_info is not None and not is_occluded_label
+
+                def detector_primary_reason(diag):
+                    if not diag:
+                        return 'other'
+                    if diag.get('total_contours', 0) == 0:
+                        return 'no_contours'
+                    candidates = {
+                        'filtered_area': diag.get('filtered_area', 0),
+                        'filtered_solidity': diag.get('filtered_solidity', 0),
+                        'filtered_circularity': diag.get('filtered_circularity', 0),
+                        'filtered_perimeter': diag.get('filtered_perimeter', 0),
+                        'filtered_distance': diag.get('filtered_too_far', 0),
+                    }
+                    reason, count = max(candidates.items(), key=lambda item: item[1])
+                    return reason if count > 0 else 'other'
+
                 if has_valid_label:
+                    label_frames += 1
                     bbox = label_info['bbox']
                     x, y, w, h = map(int, bbox)
                     cv2.rectangle(output, (x, y), (x + w, y + h), (255, 0, 255), 2)
                     # If best_ball exists, calculate IoU and print to terminal
                     if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
+                        label_tracked_frames += 1
                         det_x = int(best_ball['cx'] - best_ball['r'])
                         det_y = int(best_ball['cy'] - best_ball['r'])
                         det_w = int(2 * best_ball['r'])
@@ -263,13 +307,56 @@ class VideoProcessor:
                         iou_evaluated_frames += 1
                         if iou > 0.5:
                             iou_match_frames += 1
+                        else:
+                            iou_low_or_no_score_frames += 1
                         evaluation.add_iou(iou)
+                    else:
+                        label_not_tracked_frames += 1
+                        if not allow_tracking:
+                            label_not_tracked_background_frames += 1
+                        else:
+                            label_not_tracked_detector_frames += 1
+                            detector_reason = detector_primary_reason(detector_diagnostics)
+                            if detector_reason == 'no_contours':
+                                label_detector_no_contours_frames += 1
+                            elif detector_reason == 'filtered_area':
+                                label_detector_filtered_area_frames += 1
+                            elif detector_reason == 'filtered_solidity':
+                                label_detector_filtered_solidity_frames += 1
+                            elif detector_reason == 'filtered_circularity':
+                                label_detector_filtered_circularity_frames += 1
+                            elif detector_reason == 'filtered_perimeter':
+                                label_detector_filtered_perimeter_frames += 1
+                            elif detector_reason == 'filtered_distance':
+                                label_detector_filtered_distance_frames += 1
+                            else:
+                                label_detector_other_frames += 1
                 else:
                     no_label_frames += 1
                     if best_ball is not None:
                         no_label_tracked_ball_frames += 1
-                    elif not allow_tracking:
-                        no_label_skipped_background_frames += 1
+                    else:
+                        no_label_not_tracked_frames += 1
+                        if not allow_tracking:
+                            no_label_skipped_background_frames += 1
+                            no_label_not_tracked_background_frames += 1
+                        else:
+                            no_label_not_tracked_detector_frames += 1
+                            detector_reason = detector_primary_reason(detector_diagnostics)
+                            if detector_reason == 'no_contours':
+                                no_label_detector_no_contours_frames += 1
+                            elif detector_reason == 'filtered_area':
+                                no_label_detector_filtered_area_frames += 1
+                            elif detector_reason == 'filtered_solidity':
+                                no_label_detector_filtered_solidity_frames += 1
+                            elif detector_reason == 'filtered_circularity':
+                                no_label_detector_filtered_circularity_frames += 1
+                            elif detector_reason == 'filtered_perimeter':
+                                no_label_detector_filtered_perimeter_frames += 1
+                            elif detector_reason == 'filtered_distance':
+                                no_label_detector_filtered_distance_frames += 1
+                            else:
+                                no_label_detector_other_frames += 1
 
                 t9 = time.time()
                 cv2.imshow('frame output', output)
@@ -330,11 +417,34 @@ class VideoProcessor:
             "total_video_frames": total_video_frames,
             "processed_loop_frames": processed_frames,
             "found_ball_frames": found_ball_frames,
+            "label_frames": label_frames,
+            "label_tracked_frames": label_tracked_frames,
+            "label_not_tracked_frames": label_not_tracked_frames,
+            "label_not_tracked_background_frames": label_not_tracked_background_frames,
+            "label_not_tracked_detector_frames": label_not_tracked_detector_frames,
+            "label_detector_no_contours_frames": label_detector_no_contours_frames,
+            "label_detector_filtered_area_frames": label_detector_filtered_area_frames,
+            "label_detector_filtered_solidity_frames": label_detector_filtered_solidity_frames,
+            "label_detector_filtered_circularity_frames": label_detector_filtered_circularity_frames,
+            "label_detector_filtered_perimeter_frames": label_detector_filtered_perimeter_frames,
+            "label_detector_filtered_distance_frames": label_detector_filtered_distance_frames,
+            "label_detector_other_frames": label_detector_other_frames,
             "iou_evaluated_frames": iou_evaluated_frames,
             "iou_match_frames": iou_match_frames,
+            "iou_low_or_no_score_frames": iou_low_or_no_score_frames,
             "grass_or_blue_frames": grass_or_blue_frames,
             "no_label_frames": no_label_frames,
             "no_label_tracked_ball_frames": no_label_tracked_ball_frames,
+            "no_label_not_tracked_frames": no_label_not_tracked_frames,
+            "no_label_not_tracked_background_frames": no_label_not_tracked_background_frames,
+            "no_label_not_tracked_detector_frames": no_label_not_tracked_detector_frames,
+            "no_label_detector_no_contours_frames": no_label_detector_no_contours_frames,
+            "no_label_detector_filtered_area_frames": no_label_detector_filtered_area_frames,
+            "no_label_detector_filtered_solidity_frames": no_label_detector_filtered_solidity_frames,
+            "no_label_detector_filtered_circularity_frames": no_label_detector_filtered_circularity_frames,
+            "no_label_detector_filtered_perimeter_frames": no_label_detector_filtered_perimeter_frames,
+            "no_label_detector_filtered_distance_frames": no_label_detector_filtered_distance_frames,
+            "no_label_detector_other_frames": no_label_detector_other_frames,
             "no_label_skipped_background_frames": no_label_skipped_background_frames,
             "stop_requested": self.stop_requested,
         }
@@ -342,10 +452,41 @@ class VideoProcessor:
             "[RUN METRICS] "
             f"total_video_frames={run_metrics['total_video_frames']} | "
             f"found_ball={run_metrics['found_ball_frames']} | "
-            f"iou_match_gt_0.5={run_metrics['iou_match_frames']} | "
-            f"grass_or_blue={run_metrics['grass_or_blue_frames']} | "
-            f"no_label={run_metrics['no_label_frames']} | "
-            f"no_label_tracked_ball={run_metrics['no_label_tracked_ball_frames']} | "
-            f"no_label_bg_skipped={run_metrics['no_label_skipped_background_frames']}"
+            f"grass_or_blue={run_metrics['grass_or_blue_frames']}"
+        )
+        print("[RUN METRICS HIERARCHY]")
+        print(f"  1a no_label={run_metrics['no_label_frames']}")
+        print(f"    1a1 tracked={run_metrics['no_label_tracked_ball_frames']}")
+        print(f"    1a2 not_tracked={run_metrics['no_label_not_tracked_frames']}")
+        print(
+            f"      reasons: background_classification={run_metrics['no_label_not_tracked_background_frames']}, "
+            f"detector_no_ball_found={run_metrics['no_label_not_tracked_detector_frames']}"
+        )
+        print(
+            f"        detector subreasons: no_contours={run_metrics['no_label_detector_no_contours_frames']}, "
+            f"filtered_area={run_metrics['no_label_detector_filtered_area_frames']}, "
+            f"filtered_solidity={run_metrics['no_label_detector_filtered_solidity_frames']}, "
+            f"filtered_circularity={run_metrics['no_label_detector_filtered_circularity_frames']}, "
+            f"filtered_perimeter={run_metrics['no_label_detector_filtered_perimeter_frames']}, "
+            f"filtered_distance={run_metrics['no_label_detector_filtered_distance_frames']}, "
+            f"other={run_metrics['no_label_detector_other_frames']}"
+        )
+        print(f"  1b label={run_metrics['label_frames']}")
+        print(f"    1b1 tracked={run_metrics['label_tracked_frames']}")
+        print(f"      1b1a IoU>0.5={run_metrics['iou_match_frames']}")
+        print(f"      1b1b low_or_no_score={run_metrics['iou_low_or_no_score_frames']}")
+        print(f"    1b2 not_tracked={run_metrics['label_not_tracked_frames']}")
+        print(
+            f"      reasons: background_classification={run_metrics['label_not_tracked_background_frames']}, "
+            f"detector_no_ball_found={run_metrics['label_not_tracked_detector_frames']}"
+        )
+        print(
+            f"        detector subreasons: no_contours={run_metrics['label_detector_no_contours_frames']}, "
+            f"filtered_area={run_metrics['label_detector_filtered_area_frames']}, "
+            f"filtered_solidity={run_metrics['label_detector_filtered_solidity_frames']}, "
+            f"filtered_circularity={run_metrics['label_detector_filtered_circularity_frames']}, "
+            f"filtered_perimeter={run_metrics['label_detector_filtered_perimeter_frames']}, "
+            f"filtered_distance={run_metrics['label_detector_filtered_distance_frames']}, "
+            f"other={run_metrics['label_detector_other_frames']}"
         )
         return run_metrics

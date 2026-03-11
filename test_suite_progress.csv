@@ -1,0 +1,6 @@
+test_name,swept_param,swept_value,max_frames,wait_key_delay_ms,input_solidity_min,input_circularity,input_size_min,input_size_max,input_max_jump_pixels,input_weight_y_boost,summary_iou,total_video_frames,processed_loop_frames,found_ball_frames,label_frames,label_tracked_frames,label_not_tracked_frames,iou_evaluated_frames,iou_match_frames,iou_low_or_no_score_frames,grass_or_blue_frames,no_label_frames,no_label_tracked_ball_frames,no_label_not_tracked_frames,stop_requested
+max_jump_pixels,MAX_JUMP_PIXELS,75,50,0,0.8,67,50,20000,75,1.0,0.06237204187639134,0,50,19,50,19,31,19,2,17,50,0,0,0,False
+max_jump_pixels,MAX_JUMP_PIXELS,150,50,0,0.8,67,50,20000,150,1.0,0.06237204187639134,0,50,19,50,19,31,19,2,17,50,0,0,0,False
+max_jump_pixels,MAX_JUMP_PIXELS,300,50,0,0.8,67,50,20000,300,1.0,0.06970992915596678,0,50,17,50,17,33,17,2,15,50,0,0,0,False
+max_jump_pixels,MAX_JUMP_PIXELS,600,50,0,0.8,67,50,20000,600,1.0,0.06237204187639134,0,50,19,50,19,31,19,2,17,50,0,0,0,False
+max_jump_pixels,MAX_JUMP_PIXELS,1000,50,0,0.8,67,50,20000,1000,1.0,0.06237204187639134,0,50,19,50,19,31,19,2,17,50,0,0,0,False
