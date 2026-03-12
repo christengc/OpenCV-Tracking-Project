@@ -296,6 +296,15 @@ def _build_fused_blob_candidate(
     }
 
 
+def _build_circle_contour(cx, cy, r, points=36):
+    """Build a polygon contour approximating a circle for candidate flow usage."""
+    radius = max(2.0, float(r))
+    theta = np.linspace(0.0, 2.0 * np.pi, num=max(12, int(points)), endpoint=False)
+    xs = np.round(float(cx) + radius * np.cos(theta)).astype(np.int32)
+    ys = np.round(float(cy) + radius * np.sin(theta)).astype(np.int32)
+    return np.stack([xs, ys], axis=1).reshape(-1, 1, 2)
+
+
 def waterMaks(inputImage, hsv):
     # use configured HSV ranges for water areas
     return cv2.inRange(hsv, WATER_LOWER, WATER_UPPER)
@@ -477,10 +486,14 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
                 expected_radius=mean_diam / 2.0,
             )
             if fused_scan_match is not None:
-                raw_ml_positive_contour_ids.add(id(cnt))
-                positive_ml_contour_ids.add(id(cnt))
+                fused_ball_cnt = _build_circle_contour(
+                    fused_scan_match['cx'],
+                    fused_scan_match['cy'],
+                    fused_scan_match['r'],
+                )
+                raw_ml_positive_contour_ids.add(id(fused_ball_cnt))
                 fused_candidate = _build_fused_blob_candidate(
-                    cnt,
+                    fused_ball_cnt,
                     m,
                     fused_scan_match,
                     last_ball,
@@ -499,7 +512,7 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
                     countourCorrectScore += 1
                     best_score = fused_candidate['score']
                     best_ball = (fused_candidate['cx'], fused_candidate['cy'], fused_candidate['r'])
-                contour_statuses.append((cnt, 'ml_ball'))
+                contour_statuses.append((fused_ball_cnt, 'fused_svm_ball'))
                 if debug:
                     margin_text = f", margin={fused_candidate['ml_margin']:.3f}" if fused_candidate['ml_margin'] is not None else ""
                     print(
@@ -628,6 +641,7 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
         'wrong_circularity': (255, 0, 0),# Blue
         'too_far': (0, 165, 255),        # Orange
         'ml_ball': (0, 255, 255),       # Yellow
+        'fused_svm_ball': (0, 255, 255),# Yellow
         'passed': (0, 255, 0),           # Green
         'fused_blob': (255, 255, 0),     # Cyan
         'splitted_blob': (0, 0, 139),    # Dark red
@@ -661,6 +675,11 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
 
     for cnt, _ in splitted_statuses:
         cv2.drawContours(mask_vis, [cnt], -1, color_map['splitted_blob'], 2)
+
+    # Always highlight the top-scoring candidate in green.
+    if candidate_contours:
+        best_cand_for_mask = max(candidate_contours, key=lambda x: x['score'])
+        cv2.drawContours(mask_vis, [best_cand_for_mask['cnt']], -1, (0, 255, 0), 3)
 
     # Draw score next to each candidate contour
     for cand in candidate_contours:
