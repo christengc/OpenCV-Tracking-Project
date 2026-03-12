@@ -25,6 +25,7 @@ from config import (
     SVM_MAX_TRAIN_FRAMES,
     SVM_PATCH_SIZE,
     SVM_TEST_RATIO,
+    SVM_NEGATIVE_PATCH_RATIO,
     SVM_KERNEL,
     SVM_C,
     SVM_GAMMA,
@@ -41,6 +42,7 @@ def collect_annotation_and_random_patch_features_local(
     start_frame=1,
     max_frames=2000,
     patch_size=20,
+    negative_ratio=1,
     random_seed=0,
 ):
     """Collect paired annotation/random patch features and labels."""
@@ -49,6 +51,7 @@ def collect_annotation_and_random_patch_features_local(
     labels = []
     half = patch_size // 2
     rng = np.random.default_rng(random_seed)
+    negative_ratio = max(1, int(negative_ratio))
 
     def _to_feature_column(patch_bgr):
         gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
@@ -117,14 +120,16 @@ def collect_annotation_and_random_patch_features_local(
             continue
 
         ann_patch = _extract_center_patch(frame, bbox)
-        rand_patch = _extract_random_non_overlap_patch(frame, bbox)
-        if rand_patch is None:
-            continue
-
         feature_columns.append(_to_feature_column(ann_patch))
         labels.append(1)
-        feature_columns.append(_to_feature_column(rand_patch))
-        labels.append(0)
+
+        # Collect multiple negatives per positive to better reflect class imbalance.
+        for _ in range(negative_ratio):
+            rand_patch = _extract_random_non_overlap_patch(frame, bbox)
+            if rand_patch is None:
+                continue
+            feature_columns.append(_to_feature_column(rand_patch))
+            labels.append(0)
 
     video_capture.set(cv2.CAP_PROP_POS_FRAMES, original_pos)
 
@@ -188,6 +193,7 @@ class VideoProcessor:
         self.diameter_history = []  # For diameter likelihood scoring
         self.patch_classifier = None
         self.patch_classifier_name = None
+        self.patch_classifier_patch_size = int(SVM_PATCH_SIZE)
         self.patch_classifier_use_confidence_gate = bool(SVM_ENABLE_CONFIDENCE_GATE)
         self.patch_classifier_min_margin = float(SVM_MIN_DECISION_MARGIN)
         # Backward compatibility for existing detector code paths
@@ -224,6 +230,7 @@ class VideoProcessor:
             start_frame=self.start_frame_number,
             max_frames=max_frames,
             patch_size=patch_size,
+            negative_ratio=SVM_NEGATIVE_PATCH_RATIO,
             random_seed=0,
         )
 
@@ -325,13 +332,15 @@ class VideoProcessor:
 
         self.patch_classifier = svm
         self.patch_classifier_name = "svm"
+        self.patch_classifier_patch_size = int(patch_size)
         # Backward compatibility with existing detector code paths.
         self.knn_model = svm
 
         print(
             f"SVM data shape: X_all={X_all.shape}, y_all={y_all.shape}, "
             f"train={X_train.shape[0]}, test={X_test.shape[0]}, "
-            f"class_balance_all=(ones={int(np.sum(y_all == 1))}, zeros={int(np.sum(y_all == 0))})"
+            f"class_balance_all=(ones={int(np.sum(y_all == 1))}, zeros={int(np.sum(y_all == 0))}), "
+            f"neg_ratio_target={int(SVM_NEGATIVE_PATCH_RATIO)}"
         )
         print(
             "SVM train metrics: "
