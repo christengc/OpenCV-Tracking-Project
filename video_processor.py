@@ -802,6 +802,32 @@ class VideoProcessor:
                             else:
                                 no_label_detector_other_frames += 1
 
+                # Live confusion-matrix counters to monitor which scenes increase errors.
+                strict_tp = iou_match_frames
+                strict_fn = label_not_tracked_frames + iou_low_or_no_score_frames
+                strict_fp = no_label_tracked_ball_frames
+                strict_tn = no_label_not_tracked_frames
+                any_tp = label_tracked_frames
+                any_fn = label_not_tracked_frames
+                any_fp = no_label_tracked_ball_frames
+                any_tn = no_label_not_tracked_frames
+
+                cm_lines = [
+                    f"CM IoU>0.5 TP:{strict_tp} FN:{strict_fn} FP:{strict_fp} TN:{strict_tn}",
+                    f"CM AnyDet TP:{any_tp} FN:{any_fn} FP:{any_fp} TN:{any_tn}",
+                    f"Scene:{scene_type}",
+                ]
+                cm_font = cv2.FONT_HERSHEY_SIMPLEX
+                cm_scale = 0.52
+                cm_thick = 1
+                cm_x = 12
+                cm_y = 22
+                cm_step = 18
+                for idx, line in enumerate(cm_lines):
+                    y = cm_y + idx * cm_step
+                    cv2.putText(output, line, (cm_x + 1, y + 1), cm_font, cm_scale, (0, 0, 0), cm_thick + 2, cv2.LINE_AA)
+                    cv2.putText(output, line, (cm_x, y), cm_font, cm_scale, (255, 255, 255), cm_thick, cv2.LINE_AA)
+
                 # Draw centered scene-shift notification for 1 second
                 if time.time() < self._scene_shift_display_until:
                     h_fr, w_fr = output.shape[:2]
