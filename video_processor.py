@@ -22,8 +22,118 @@ from config import (
     WAIT_KEY_DELAY_MS,
     SCENE_SHIFT_THRESHOLD,
     MAX_FRAMES_WITHOUT_BALL,
+    SVM_MAX_TRAIN_FRAMES,
+    SVM_PATCH_SIZE,
+    SVM_TEST_RATIO,
+    SVM_KERNEL,
+    SVM_C,
+    SVM_GAMMA,
+    SVM_CLASS_WEIGHT,
+    SVM_ENABLE_CONFIDENCE_GATE,
+    SVM_MIN_DECISION_MARGIN,
 )
 import config
+
+
+def collect_annotation_and_random_patch_features_local(
+    video_capture,
+    coco_ann,
+    start_frame=1,
+    max_frames=2000,
+    patch_size=20,
+    random_seed=0,
+):
+    """Collect paired annotation/random patch features and labels."""
+    feature_len = patch_size * patch_size
+    feature_columns = []
+    labels = []
+    half = patch_size // 2
+    rng = np.random.default_rng(random_seed)
+
+    def _to_feature_column(patch_bgr):
+        gray = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        normalized = cv2.normalize(blurred, None, 0, 255, cv2.NORM_MINMAX)
+        return normalized.reshape(feature_len, 1).astype(np.uint8)
+
+    def _extract_center_patch(frame, bbox):
+        x, y, w, h = [float(v) for v in bbox[:4]]
+        cx = int(round(x + w / 2.0))
+        cy = int(round(y + h / 2.0))
+        padded = cv2.copyMakeBorder(
+            frame, half, half, half, half, cv2.BORDER_REFLECT_101
+        )
+        px = cx + half
+        py = cy + half
+        patch = padded[py - half:py + half, px - half:px + half]
+        if patch.shape[:2] != (patch_size, patch_size):
+            patch = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_LINEAR)
+        return patch
+
+    def _overlaps_bbox(px, py, bbox):
+        x, y, w, h = [float(v) for v in bbox[:4]]
+        return not (px + patch_size <= x or px >= x + w or py + patch_size <= y or py >= y + h)
+
+    def _extract_random_non_overlap_patch(frame, bbox, max_attempts=200):
+        h, w = frame.shape[:2]
+        if w < patch_size or h < patch_size:
+            return None
+        max_x = w - patch_size
+        max_y = h - patch_size
+        for _ in range(max_attempts):
+            px = int(rng.integers(0, max_x + 1))
+            py = int(rng.integers(0, max_y + 1))
+            if _overlaps_bbox(px, py, bbox):
+                continue
+            return frame[py:py + patch_size, px:px + patch_size]
+        return None
+
+    original_pos = int(video_capture.get(cv2.CAP_PROP_POS_FRAMES))
+    first_idx = max(0, int(start_frame) - 1)
+    video_capture.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+
+    for _ in range(max_frames):
+        ok, frame = video_capture.read()
+        if not ok:
+            break
+
+        frame_id = int(video_capture.get(cv2.CAP_PROP_POS_FRAMES))
+        ann_entry = coco_ann.get(frame_id)
+        if ann_entry is None:
+            continue
+
+        if isinstance(ann_entry, dict):
+            candidates = [ann_entry]
+        else:
+            candidates = [a for a in ann_entry if isinstance(a, dict)]
+
+        bbox = None
+        for ann in candidates:
+            b = ann.get("bbox")
+            if b is not None and len(b) >= 4:
+                bbox = b
+                break
+        if bbox is None:
+            continue
+
+        ann_patch = _extract_center_patch(frame, bbox)
+        rand_patch = _extract_random_non_overlap_patch(frame, bbox)
+        if rand_patch is None:
+            continue
+
+        feature_columns.append(_to_feature_column(ann_patch))
+        labels.append(1)
+        feature_columns.append(_to_feature_column(rand_patch))
+        labels.append(0)
+
+    video_capture.set(cv2.CAP_PROP_POS_FRAMES, original_pos)
+
+    if not feature_columns:
+        return np.empty((feature_len, 0), dtype=np.uint8), np.empty((0,), dtype=np.uint8)
+
+    feature_matrix = np.hstack(feature_columns)
+    label_vector = np.array(labels, dtype=np.uint8)
+    return feature_matrix, label_vector
 
 
 class VideoProcessor:
@@ -76,6 +186,12 @@ class VideoProcessor:
         self.actual_diameters = []
         self.diameter_diffs = []
         self.diameter_history = []  # For diameter likelihood scoring
+        self.patch_classifier = None
+        self.patch_classifier_name = None
+        self.patch_classifier_use_confidence_gate = bool(SVM_ENABLE_CONFIDENCE_GATE)
+        self.patch_classifier_min_margin = float(SVM_MIN_DECISION_MARGIN)
+        # Backward compatibility for existing detector code paths
+        self.knn_model = None
 
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -83,6 +199,162 @@ class VideoProcessor:
 
     def enable_mouse_capture(self, window_name):
         cv2.setMouseCallback(window_name, self.mouse_callback)
+
+    def initialize_svm_model(self, coco_ann, max_frames=2000, patch_size=20):
+        """Train an SVM classifier on annotation/random patches."""
+        try:
+            import importlib
+
+            sklearn_svm = importlib.import_module("sklearn.svm")
+            sklearn_pipeline = importlib.import_module("sklearn.pipeline")
+            sklearn_preprocessing = importlib.import_module("sklearn.preprocessing")
+            SVC = getattr(sklearn_svm, "SVC")
+            make_pipeline = getattr(sklearn_pipeline, "make_pipeline")
+            StandardScaler = getattr(sklearn_preprocessing, "StandardScaler")
+        except ImportError:
+            print("SVM init skipped: scikit-learn is not installed")
+            self.patch_classifier = None
+            self.patch_classifier_name = None
+            self.knn_model = None
+            return
+
+        feature_matrix, label_vector = collect_annotation_and_random_patch_features_local(
+            self.vid,
+            coco_ann,
+            start_frame=self.start_frame_number,
+            max_frames=max_frames,
+            patch_size=patch_size,
+            random_seed=0,
+        )
+
+        if feature_matrix.shape[1] == 0 or label_vector.size == 0:
+            print("SVM init skipped: no training samples collected")
+            self.patch_classifier = None
+            self.patch_classifier_name = None
+            self.knn_model = None
+            return
+
+        X_all = feature_matrix.T
+        y_all = label_vector
+
+        def _binary_metrics(y_true, y_pred):
+            y_true = np.asarray(y_true).astype(np.uint8)
+            y_pred = np.asarray(y_pred).astype(np.uint8)
+            tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+            tn = int(np.sum((y_true == 0) & (y_pred == 0)))
+            fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+            fn = int(np.sum((y_true == 1) & (y_pred == 0)))
+            total = y_true.size
+            accuracy = float((tp + tn) / total) if total > 0 else 0.0
+            precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            f1 = float((2 * precision * recall) / (precision + recall)) if (precision + recall) > 0 else 0.0
+            return {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "tp": tp,
+                "tn": tn,
+                "fp": fp,
+                "fn": fn,
+            }
+
+        pos_idx = np.where(y_all == 1)[0]
+        neg_idx = np.where(y_all == 0)[0]
+        if pos_idx.size == 0 or neg_idx.size == 0:
+            print("SVM init skipped: training data does not contain both classes")
+            self.patch_classifier = None
+            self.patch_classifier_name = None
+            self.knn_model = None
+            return
+
+        rng = np.random.default_rng(42)
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+        test_ratio = float(SVM_TEST_RATIO)
+        pos_test_count = max(1, int(round(pos_idx.size * test_ratio)))
+        neg_test_count = max(1, int(round(neg_idx.size * test_ratio)))
+        if pos_idx.size - pos_test_count < 1:
+            pos_test_count = max(0, pos_idx.size - 1)
+        if neg_idx.size - neg_test_count < 1:
+            neg_test_count = max(0, neg_idx.size - 1)
+
+        test_idx = np.concatenate([
+            pos_idx[:pos_test_count],
+            neg_idx[:neg_test_count],
+        ])
+        rng.shuffle(test_idx)
+        train_mask = np.ones(y_all.size, dtype=bool)
+        train_mask[test_idx] = False
+        train_idx = np.where(train_mask)[0]
+
+        X_train = X_all[train_idx]
+        y_train = y_all[train_idx]
+
+        X_test = X_all[test_idx] if test_idx.size > 0 else np.empty((0, X_all.shape[1]), dtype=X_all.dtype)
+        y_test = y_all[test_idx] if test_idx.size > 0 else np.empty((0,), dtype=y_all.dtype)
+
+        unique_classes = np.unique(y_train)
+        if unique_classes.size < 2:
+            print("SVM init skipped: training data only contains one class")
+            self.patch_classifier = None
+            self.patch_classifier_name = None
+            self.knn_model = None
+            return
+
+        svm = make_pipeline(
+            StandardScaler(),
+            SVC(
+                kernel=SVM_KERNEL,
+                C=float(SVM_C),
+                gamma=SVM_GAMMA,
+                class_weight=SVM_CLASS_WEIGHT,
+            ),
+        )
+        svm.fit(X_train, y_train)
+
+        train_pred = svm.predict(X_train)
+        train_metrics = _binary_metrics(y_train, train_pred)
+
+        if y_test.size > 0:
+            test_pred = svm.predict(X_test)
+            test_metrics = _binary_metrics(y_test, test_pred)
+        else:
+            test_metrics = None
+
+        self.patch_classifier = svm
+        self.patch_classifier_name = "svm"
+        # Backward compatibility with existing detector code paths.
+        self.knn_model = svm
+
+        print(
+            f"SVM data shape: X_all={X_all.shape}, y_all={y_all.shape}, "
+            f"train={X_train.shape[0]}, test={X_test.shape[0]}, "
+            f"class_balance_all=(ones={int(np.sum(y_all == 1))}, zeros={int(np.sum(y_all == 0))})"
+        )
+        print(
+            "SVM train metrics: "
+            f"accuracy={train_metrics['accuracy']:.3f}, "
+            f"precision={train_metrics['precision']:.3f}, "
+            f"recall={train_metrics['recall']:.3f}, "
+            f"f1={train_metrics['f1']:.3f}, "
+            f"cm=[[TN={train_metrics['tn']}, FP={train_metrics['fp']}], "
+            f"[FN={train_metrics['fn']}, TP={train_metrics['tp']}]]"
+        )
+        if test_metrics is not None:
+            print(
+                "SVM test metrics: "
+                f"accuracy={test_metrics['accuracy']:.3f}, "
+                f"precision={test_metrics['precision']:.3f}, "
+                f"recall={test_metrics['recall']:.3f}, "
+                f"f1={test_metrics['f1']:.3f}, "
+                f"cm=[[TN={test_metrics['tn']}, FP={test_metrics['fp']}], "
+                f"[FN={test_metrics['fn']}, TP={test_metrics['tp']}]]"
+            )
+        else:
+            print("SVM test metrics: skipped (insufficient test samples)")
+        print("SVM training complete")
 
     def run(self):
         self.stop_requested = False
@@ -141,6 +413,12 @@ class VideoProcessor:
         else:
             coco_ann = {}
             print(f"[LABELS] missing required file: {os.path.basename(coco_path)}")
+
+        self.initialize_svm_model(
+            coco_ann,
+            max_frames=SVM_MAX_TRAIN_FRAMES,
+            patch_size=SVM_PATCH_SIZE,
+        )
 
         success = True
         processed_frames = 0

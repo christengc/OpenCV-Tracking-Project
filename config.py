@@ -18,6 +18,18 @@ MAX_FRAMES_WITHOUT_BALL = 10    # after this many frames the previous ball is fo
 MAX_JUMP_PIXELS = 150          # maximum allowed jump for candidate contour
 WEIGHT_Y_BOOST = 25.0           # score boost for lower-half contours
 
+# ML patch-classifier (SVM) settings
+SVM_MAX_TRAIN_FRAMES = 2000
+SVM_PATCH_SIZE = 20
+SVM_TEST_RATIO = 0.2
+SVM_KERNEL = "rbf"
+SVM_C = 5.0
+SVM_GAMMA = "scale"
+SVM_CLASS_WEIGHT = "balanced"
+SVM_ENABLE_CONFIDENCE_GATE = True
+SVM_MIN_DECISION_MARGIN = 0.25
+ML_SCORE_BOOST = 0.8
+
 # contours and mask
 COLOR_SIMILARITY_TOLERANCE = 20  # tolerance for R/G/B channel differences
 SOLIDITY_MIN = 0.92              # minimum contour solidity (0-1)
