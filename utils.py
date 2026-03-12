@@ -122,6 +122,8 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, image, currentFra
     Returns updated state dictionary.
     """
     should_break = False
+    did_seek = False
+    reset_tracking = False
 
     if key == ord('q'):        # quit
         should_break = True
@@ -132,6 +134,7 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, image, currentFra
 
     elif key == ord('r'):      # reset tracker
         last_ball = None
+        reset_tracking = True
 
     elif key == ord('b'):      # debug and show binary mask and contour information
         # import here to avoid circular import
@@ -145,11 +148,17 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, image, currentFra
 
     elif key == ord('n'):  # rewind
         print("rewind")
-        vid.set(cv2.CAP_PROP_POS_FRAMES, currentFrameNumber - 30)
+        target = max(0, int(currentFrameNumber - 30))
+        vid.set(cv2.CAP_PROP_POS_FRAMES, target)
+        did_seek = True
+        reset_tracking = True
 
     elif key == ord('m'):  # forward
         print("forward")
-        vid.set(cv2.CAP_PROP_POS_FRAMES, currentFrameNumber + 30)
+        target = max(0, int(currentFrameNumber + 30))
+        vid.set(cv2.CAP_PROP_POS_FRAMES, target)
+        did_seek = True
+        reset_tracking = True
 
     elif key == ord('a'):      # adaptive mode toggle
         adaptive = not adaptive
@@ -169,7 +178,9 @@ def handle_keyboard_controls(key, paused, last_ball, adaptive, image, currentFra
         "paused": paused,
         "last_ball": last_ball,
         "adaptive": adaptive,
-        "should_break": should_break
+        "should_break": should_break,
+        "did_seek": did_seek,
+        "reset_tracking": reset_tracking,
     }
 
 

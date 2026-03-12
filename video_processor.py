@@ -1,4 +1,4 @@
-import time
+﻿import time
 import cv2
 import numpy as np
 
@@ -32,6 +32,11 @@ from config import (
     SVM_CLASS_WEIGHT,
     SVM_ENABLE_CONFIDENCE_GATE,
     SVM_MIN_DECISION_MARGIN,
+    KALMAN_ENABLED,
+    KALMAN_PROCESS_NOISE,
+    KALMAN_MEASUREMENT_NOISE,
+    KALMAN_MAX_DEVIATION_PIXELS,
+    KALMAN_MAX_PREDICTION_WITHOUT_CANDIDATES,
 )
 import config
 
@@ -199,12 +204,134 @@ class VideoProcessor:
         # Backward compatibility for existing detector code paths
         self.knn_model = None
 
+        self.use_kalman = bool(KALMAN_ENABLED)
+        self.kalman_max_deviation_pixels = float(KALMAN_MAX_DEVIATION_PIXELS)
+        self.kalman_filter = cv2.KalmanFilter(4, 2)
+        self.kalman_filter.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+            np.float32,
+        )
+        self.kalman_filter.measurementMatrix = np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0]],
+            np.float32,
+        )
+        self.kalman_filter.processNoiseCov = np.eye(4, dtype=np.float32) * float(KALMAN_PROCESS_NOISE)
+        self.kalman_filter.measurementNoiseCov = np.eye(2, dtype=np.float32) * float(KALMAN_MEASUREMENT_NOISE)
+        self.kalman_filter.errorCovPost = np.eye(4, dtype=np.float32)
+        self.kalman_initialized = False
+        self.kalman_last_prediction = None
+        self.kalman_frames_without_candidates = 0
+        self.kalman_max_prediction_without_candidates = int(KALMAN_MAX_PREDICTION_WITHOUT_CANDIDATES)
+        self._scene_shift_display_until = 0.0
+
     def mouse_callback(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
             print(f"Mouse click at: x={x}, y={y}")
 
     def enable_mouse_capture(self, window_name):
         cv2.setMouseCallback(window_name, self.mouse_callback)
+
+    def _kalman_predict(self):
+        if not self.use_kalman or not self.kalman_initialized:
+            return None
+        prediction = self.kalman_filter.predict()
+        pred_x = float(prediction[0, 0])
+        pred_y = float(prediction[1, 0])
+        self.kalman_last_prediction = (pred_x, pred_y)
+        return self.kalman_last_prediction
+
+    def _kalman_correct(self, x, y):
+        if not self.use_kalman:
+            return
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        self.kalman_filter.correct(measurement)
+
+    def _kalman_initialize(self, x, y):
+        self.kalman_filter.statePost = np.array(
+            [[np.float32(x)], [np.float32(y)], [np.float32(0.0)], [np.float32(0.0)]],
+            dtype=np.float32,
+        )
+        self.kalman_initialized = True
+        self.kalman_last_prediction = (float(x), float(y))
+
+    def _pick_candidate_with_kalman(self, candidate_balls, predicted_xy):
+        if not candidate_balls:
+            return None
+        if predicted_xy is None:
+            return max(candidate_balls, key=lambda c: c.get('score', 0.0))
+
+        pred_x, pred_y = predicted_xy
+        nearest = min(
+            candidate_balls,
+            key=lambda c: np.hypot(float(c['cx']) - pred_x, float(c['cy']) - pred_y),
+        )
+        deviation = float(np.hypot(float(nearest['cx']) - pred_x, float(nearest['cy']) - pred_y))
+        if deviation <= self.kalman_max_deviation_pixels:
+            return nearest
+        return None
+
+    def _choose_ball_with_motion_model(self, detector_best_ball, detector_diagnostics):
+        candidate_balls = []
+        if isinstance(detector_diagnostics, dict):
+            candidate_balls = detector_diagnostics.get('candidate_balls') or []
+        has_candidates = bool(candidate_balls) or detector_best_ball is not None
+
+        if not self.use_kalman:
+            return detector_best_ball
+
+        if has_candidates:
+            self.kalman_frames_without_candidates = 0
+        else:
+            self.kalman_frames_without_candidates += 1
+
+        predicted_xy = self._kalman_predict()
+
+        if not self.kalman_initialized:
+            if detector_best_ball is not None:
+                self._kalman_initialize(detector_best_ball['cx'], detector_best_ball['cy'])
+                return detector_best_ball
+            return None
+
+        chosen_candidate = self._pick_candidate_with_kalman(candidate_balls, predicted_xy)
+        if chosen_candidate is not None:
+            self._kalman_correct(chosen_candidate['cx'], chosen_candidate['cy'])
+            chosen = dict(chosen_candidate)
+            chosen['from_kalman_prediction'] = False
+            return chosen
+
+        if self.kalman_frames_without_candidates > self.kalman_max_prediction_without_candidates:
+            self.kalman_initialized = False
+            self.kalman_last_prediction = None
+            return None
+
+        if predicted_xy is not None:
+            radius = 8.0
+            if detector_best_ball is not None and 'r' in detector_best_ball:
+                radius = float(detector_best_ball['r'])
+            elif self.last_ball is not None and 'r' in self.last_ball:
+                radius = float(self.last_ball['r'])
+            return {
+                'cx': float(predicted_xy[0]),
+                'cy': float(predicted_xy[1]),
+                'r': float(max(3.0, radius)),
+                'score': float('-inf'),
+                'from_kalman_prediction': True,
+            }
+
+        return detector_best_ball
+
+    def _reset_tracking_state(self, reason="manual"):
+        self.last_ball = None
+        self.framesWithoutBall = 0
+        self.previous_frame = None
+        self._last_classification_result = None
+        self.frameCount = 0
+        self.diameter_history = []
+        self.kalman_initialized = False
+        self.kalman_last_prediction = None
+        self.kalman_frames_without_candidates = 0
+        self.golfBall = GolfBall()
+        print(f"[TRACK RESET] reason={reason}")
 
     def initialize_svm_model(self, coco_ann, max_frames=2000, patch_size=20):
         """Train an SVM classifier on annotation/random patches."""
@@ -399,7 +526,7 @@ class VideoProcessor:
         label_not_tracked_detector_frames = 0
         no_label_skipped_background_frames = 0
         import os, json
-        # Indlæs COCO-annotationer én gang fra split/outline labels
+        # IndlÃ¦s COCO-annotationer Ã©n gang fra split/outline labels
         coco_path = os.path.join(os.path.dirname(__file__), 'coco splitandoutline.json')
         if os.path.exists(coco_path):
             with open(coco_path, 'r', encoding='utf-8') as f:
@@ -461,14 +588,28 @@ class VideoProcessor:
                             self.previous_frame, image, threshold=SCENE_SHIFT_THRESHOLD
                         )
                         t31b = time.time()
+                        if result["shift_score"] > 5.0:
+                            frame_no = int(self.vid.get(cv2.CAP_PROP_POS_FRAMES))
+                            print(f"[SHIFT SCORE] frame={frame_no} score={result['shift_score']} hist={result['histogram_diff']} diff={result['frame_diff']} edge={result.get('edge_diff','?')} (threshold={SCENE_SHIFT_THRESHOLD})")
                         if result["is_scene_shift"]:
                             print(f"Scene shift detected! Score: {result['shift_score']}")
-                            self.diameter_history = []
+                            self._reset_tracking_state(reason="scene_shift")
+                            self._scene_shift_display_until = time.time() + 1.0
                     self.previous_frame = image
 
                     t4 = time.time()
                     classification_result = self.sceneCalculator.classify_frame(image)
                     t5 = time.time()
+
+                    # Secondary check: if scene classification type changed, also treat as scene shift
+                    prev_classification = getattr(self, '_last_classification_result', None)
+                    if prev_classification is not None and classification_result is not None:
+                        prev_type = prev_classification.get("classification")
+                        new_type = classification_result.get("classification")
+                        if prev_type != new_type and time.time() > self._scene_shift_display_until:
+                            print(f"Scene type change detected: {prev_type} -> {new_type}")
+                            self._reset_tracking_state(reason="scene_type_change")
+                            self._scene_shift_display_until = time.time() + 1.0
                 else:
                     # Use previous results if not recalculating
                     classification_result = getattr(self, '_last_classification_result', None)
@@ -502,8 +643,9 @@ class VideoProcessor:
                         player_rect=player_rect
                     )
                     output = findball_result['output']
-                    best_ball = findball_result['best_ball']
+                    detector_best_ball = findball_result['best_ball']
                     detector_diagnostics = findball_result.get('diagnostics')
+                    best_ball = self._choose_ball_with_motion_model(detector_best_ball, detector_diagnostics)
                     t61b = time.time()
                     # Get actual ball diameter from best_ball if available
                     if best_ball is not None and 'r' in best_ball:
@@ -549,9 +691,24 @@ class VideoProcessor:
                 if best_ball is not None and 'cx' in best_ball and 'cy' in best_ball and 'r' in best_ball:
                     center = (int(best_ball['cx']), int(best_ball['cy']))
                     radius = int(best_ball['r'])
-                    cv2.circle(output, center, max(radius-2,1), (255, 0, 0), 2)   # r-1, rød
-                    cv2.circle(output, center, radius, (0, 255, 0), 2)           # r, grøn
-                    cv2.circle(output, center, radius+2, (0, 0, 255), 2)         # r+1, blå
+                    cv2.circle(output, center, max(radius-2,1), (255, 0, 0), 2)   # r-1, rÃ¸d
+                    cv2.circle(output, center, radius, (0, 255, 0), 2)           # r, grÃ¸n
+                    cv2.circle(output, center, radius+2, (0, 0, 255), 2)         # r+1, blÃ¥
+
+                    source_is_kalman = bool(best_ball.get('from_kalman_prediction', False))
+                    source_text = "KALMAN" if source_is_kalman else "CANDIDATE"
+                    source_color = (0, 165, 255) if source_is_kalman else (0, 255, 0)
+                    text_origin = (max(10, center[0] + radius + 12), max(24, center[1] - radius - 12))
+                    cv2.putText(
+                        output,
+                        source_text,
+                        text_origin,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        source_color,
+                        2,
+                        cv2.LINE_AA,
+                    )
 
                 if player_rect is not None:
                     cv2.drawContours(output, [player_rect], -1, (255, 0, 0), 2)
@@ -645,6 +802,19 @@ class VideoProcessor:
                             else:
                                 no_label_detector_other_frames += 1
 
+                # Draw centered scene-shift notification for 1 second
+                if time.time() < self._scene_shift_display_until:
+                    h_fr, w_fr = output.shape[:2]
+                    sc_text = "SCENE SHIFT"
+                    sc_font = cv2.FONT_HERSHEY_SIMPLEX
+                    sc_scale = 1.4
+                    sc_thick = 3
+                    (tw, th), _ = cv2.getTextSize(sc_text, sc_font, sc_scale, sc_thick)
+                    tx = (w_fr - tw) // 2
+                    ty = (h_fr + th) // 2
+                    cv2.putText(output, sc_text, (tx + 2, ty + 2), sc_font, sc_scale, (0, 0, 0), sc_thick + 2, cv2.LINE_AA)
+                    cv2.putText(output, sc_text, (tx, ty), sc_font, sc_scale, (0, 200, 255), sc_thick, cv2.LINE_AA)
+
                 t9 = time.time()
                 cv2.imshow('frame output', output)
                 self.enable_mouse_capture('frame output')
@@ -687,6 +857,10 @@ class VideoProcessor:
             self.paused = control_result["paused"]
             self.last_ball = control_result["last_ball"]
             self.adaptive = control_result["adaptive"]
+
+            if control_result.get("reset_tracking", False):
+                reset_reason = "seek" if control_result.get("did_seek", False) else "manual_reset"
+                self._reset_tracking_state(reason=reset_reason)
 
             if control_result["should_break"]:
                 self.stop_requested = True
@@ -777,3 +951,4 @@ class VideoProcessor:
             f"other={run_metrics['label_detector_other_frames']}"
         )
         return run_metrics
+

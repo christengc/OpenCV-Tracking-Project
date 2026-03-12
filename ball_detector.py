@@ -388,7 +388,7 @@ def createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask=Non
     return final_mask
 
 
-def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
+def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug, return_diagnostics=False):
     from config import WEIGHT_Y_BOOST, ML_SCORE_BOOST, ML_MIN_CIRCULARITY_FOR_POSITIVE, FUSED_BLOB_SCAN_STEP
     # Cache trackbar values for performance
     trackbar_values = {
@@ -737,6 +737,28 @@ def identifyContours(inputImage, binaryMask, output, tracker, last_ball, debug):
     if candidate_contours:
         best_cand = max(candidate_contours, key=lambda x: x['score'])
         best_ball_dict = best_cand
+
+    diagnostics = {
+        'total_contours': len(contours),
+        'candidate_contours': len(candidate_contours),
+        'filtered_area': countourWrongSize,
+        'filtered_solidity': countourWrongSolidity,
+        'filtered_perimeter': countoursWrongPerimeter,
+        'filtered_circularity': countoursWrongCircularity,
+        'filtered_too_far': sum(1 for _, reason in contour_statuses if reason == 'too_far'),
+        'candidate_balls': [
+            {
+                'cx': float(cand['cx']),
+                'cy': float(cand['cy']),
+                'r': float(cand['r']),
+                'score': float(cand['score']),
+            }
+            for cand in candidate_contours
+        ],
+    }
+
+    if return_diagnostics:
+        return best_ball_dict, diagnostics
     return best_ball_dict
 
 
@@ -750,8 +772,16 @@ def findBall(inputImage, last_ball, tracker, debug, adaptive, player_rect=None):
         player_exclusion_mask = create_player_exclusion_mask(inputImage.shape, player_rect, margin=PLAYER_MASK_MARGIN)
 
     waterAndBackgroundAndMorphologyMask = createBinaryMask(inputImage, hsv, debug, adaptive, player_exclusion_mask)
-    best_ball = identifyContours(inputImage, waterAndBackgroundAndMorphologyMask, output, tracker, last_ball, debug)
-    return {'output': output, 'best_ball': best_ball}
+    best_ball, diagnostics = identifyContours(
+        inputImage,
+        waterAndBackgroundAndMorphologyMask,
+        output,
+        tracker,
+        last_ball,
+        debug,
+        return_diagnostics=True,
+    )
+    return {'output': output, 'best_ball': best_ball, 'diagnostics': diagnostics}
 
 
 def mouse_callback(event, x, y, flags, param):

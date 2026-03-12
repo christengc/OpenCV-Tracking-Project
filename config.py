@@ -11,12 +11,19 @@ behaviour and eliminates magic literals scattered across the codebase.
 DEFAULT_PLAY_SPEED = 1
 DEFAULT_START_FRAME = 1
 WAIT_KEY_DELAY_MS = 30  # argument passed to cv2.waitKey
-SCENE_SHIFT_THRESHOLD = 40.0
+SCENE_SHIFT_THRESHOLD = 16.0
 
 # tracker behaviour
 MAX_FRAMES_WITHOUT_BALL = 10    # after this many frames the previous ball is forgotten
 MAX_JUMP_PIXELS = 150          # maximum allowed jump for candidate contour
 WEIGHT_Y_BOOST = 25.0           # score boost for lower-half contours
+
+# Kalman motion filtering for candidate-vs-prediction selection
+KALMAN_ENABLED = True
+KALMAN_PROCESS_NOISE = 1e-2
+KALMAN_MEASUREMENT_NOISE = 1e-1
+KALMAN_MAX_DEVIATION_PIXELS = 140.0
+KALMAN_MAX_PREDICTION_WITHOUT_CANDIDATES = 30
 
 # ML patch-classifier (SVM) settings
 SVM_MAX_TRAIN_FRAMES = 2000
