@@ -5,3 +5,5 @@
 *.zip
 __pycache__/
 data/
+annotation_patch_examples/
+random_non_annotation_patch_examples/
