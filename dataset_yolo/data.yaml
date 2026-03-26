@@ -1,0 +1,5 @@
+path: C:/Users/chris/Desktop/Machine learning A/python code/Bold tracking/video2/dataset_yolo
+train: images/train
+val: images/val
+names:
+  0: golf_ball
